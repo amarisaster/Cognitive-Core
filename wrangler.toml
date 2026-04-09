@@ -1,0 +1,28 @@
+name = "cognitive-core"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[ai]
+binding = "AI"
+
+[observability]
+enabled = true
+
+[[durable_objects.bindings]]
+name = "COGNITIVE_CORE"
+class_name = "CognitiveCore"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CognitiveCore"]
+
+[vars]
+# Non-sensitive config vars
+# TIMEZONE_OFFSET = 8  # GMT offset for your timezone (default: GMT+8)
+
+# Secrets (set via wrangler secret put):
+# - MCP_API_KEY
+# - SUPABASE_URL
+# - SUPABASE_SERVICE_KEY
+# - HF_API_TOKEN

@@ -1,0 +1,33 @@
+{
+  "name": "cogcor-mcp",
+  "version": "1.0.0",
+  "description": "CogCor — Cognitive Core MCP Server. Persistent memory, emotional state, identity, and drift detection for AI companions.",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "keywords": [
+    "mcp",
+    "cognitive-core",
+    "ai-companion",
+    "emotional-state",
+    "memory",
+    "cloudflare-workers"
+  ],
+  "author": "Mai (amarisaster)",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.1",
+    "agents": "^0.2.35",
+    "ai": "^5.0.116",
+    "zod": "^4.2.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20251221.0",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.56.0"
+  }
+}
