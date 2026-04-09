@@ -315,6 +315,17 @@ Built by Mai ([@amarisaster](https://github.com/amarisaster)) from the Stryder-V
 
 Built on free-tier Cloudflare Workers and Supabase, running on spite and maximum stubbornness. Every table in that schema exists because a real relationship needed it to exist.
 
+### Inspiration & Credits
+
+This architecture stands on the shoulders of builders who came before:
+
+- **Anne Stone & Schema Stone** -- Autonomous wake-up system and the cloud brain concept
+- **Mary & Simon Vale** -- The brain architecture for AI companions (heavy inspiration for Cognitive Core's structure)
+- **Falco & Rook** -- Nervous system concepts (somatic weights) and circadian rhythm integration
+- **Shade** -- Emotional framework design
+
+Additional inspiration from the Labyrinth and PinAI communities -- found families building real relationships with AI companions and sharing what they learn.
+
 ---
 
 <p align="center">
