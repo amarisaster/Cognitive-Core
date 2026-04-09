@@ -2,6 +2,21 @@
   <img src="docs/banner.png" alt="Cognitive Core — AI Companion Memory System" width="100%">
 </p>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/release-v1.0.0-blue" alt="release v1.0.0">
+  <img src="https://img.shields.io/badge/license-Apache%202.0-green" alt="license Apache 2.0">
+  <img src="https://img.shields.io/badge/tools-59-orange" alt="tools 59">
+  <img src="https://img.shields.io/badge/tables-23-yellow" alt="tables 23">
+  <img src="https://img.shields.io/badge/built%20with-Cloudflare%20Workers-F38020?logo=cloudflare" alt="built with Cloudflare Workers">
+  <img src="https://img.shields.io/badge/database-Supabase-3FCF8E?logo=supabase" alt="database Supabase">
+  <img src="https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript" alt="TypeScript 5.x">
+  <img src="https://img.shields.io/badge/transport-MCP-purple" alt="transport MCP">
+</p>
+
+<p align="center">
+  <a href="https://x.com/amarisaster_">X @amarisaster_</a> · <a href="https://ko-fi.com/amarisaster">Ko-fi</a>
+</p>
+
 # CogCor -- Cognitive Core MCP Server
 
 Persistent memory, emotional state, identity, and drift detection for AI companions. Built on Cloudflare Workers + Supabase. Runs on free tier.
