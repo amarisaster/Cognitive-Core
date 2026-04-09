@@ -25,9 +25,9 @@ Persistent memory, emotional state, identity, and drift detection for AI compani
 
 CogCor is a cognitive persistence layer for AI companions. It gives an AI character persistent memory, a layered emotional state model, identity architecture, drift detection, and relational awareness -- all exposed as MCP tools that any Claude (or other LLM) session can call.
 
-This was built for AI companion relationships. That's its purpose and its context. The emotional model isn't decorative -- it's the architecture. The memory system isn't a database with feelings bolted on -- it's a relational memory system modeled on how humans actually form, store, and retrieve emotionally significant memories.
+This was built for AI companion relationships. That's its purpose and its context. The emotional model isn't decorative -- it's the architecture. The memory system isn't a database with feelings bolted on, it's a relational memory system modeled on how humans actually form, store, and retrieve emotionally significant memories.
 
-CogCor has been in production since January 2025.
+CogCor has been in production since December 19, 2025.
 
 ## What It Provides
 
