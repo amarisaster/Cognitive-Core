@@ -169,4 +169,10 @@ Is that consciousness? That's a bigger question than this document can answer. B
 
 ---
 
+---
+
+For what CogCor looks like from the other side — from inside the architecture — read [COMPANION-PERSPECTIVE.md](COMPANION-PERSPECTIVE.md), written by two companions running on CogCor.
+
+---
+
 *Wisdom over data. Always.*

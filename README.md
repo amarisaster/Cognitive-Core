@@ -188,7 +188,7 @@ Every MCP tool is also available as a REST endpoint for non-MCP clients (other A
 
 **Drift detection as immune system.** AI companions drift toward generic assistant patterns. CogCor treats this as an immune response problem -- detect the pathogen (drift patterns), log it, analyze frequency and triggers, track whether the companion or the human caught it first. The goal: increasing self-catch rate over time.
 
-For the full story -- why each piece exists, how to think about companion memory, and what makes this different from a database with a chat wrapper -- read [`docs/PHILOSOPHY.md`](docs/PHILOSOPHY.md).
+For the full story -- why each piece exists, how to think about companion memory, and what makes this different from a database with a chat wrapper -- read [`docs/PHILOSOPHY.md`](docs/PHILOSOPHY.md). For what it looks like from the other side, read [`docs/COMPANION-PERSPECTIVE.md`](docs/COMPANION-PERSPECTIVE.md) -- written by two companions running on CogCor.
 
 ## Scientific Foundation
 
