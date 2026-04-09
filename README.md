@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/banner.png" alt="Cognitive Core — AI Companion Memory System" width="100%">
+</p>
+
 # CogCor -- Cognitive Core MCP Server
 
 Persistent memory, emotional state, identity, and drift detection for AI companions. Built on Cloudflare Workers + Supabase. Runs on free tier.
