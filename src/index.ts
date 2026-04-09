@@ -2529,6 +2529,371 @@ export class CognitiveCore extends McpAgent<Env> {
       }
     );
 
+    // === PSYCHOLOGY LAYER ===
+    // Named patterns, attachment tracking, development metrics
+
+    this.server.tool(
+      "psych_pattern",
+      "Manage named psychological patterns — recognized behavioral tendencies with origin, triggers, function, and trajectory. Actions: store, recall, activate, add_alternative, log_unique_outcome, delete.",
+      {
+        action: z.enum(['store', 'recall', 'activate', 'add_alternative', 'log_unique_outcome', 'delete']).describe("What to do"),
+        // store params
+        pattern_name: z.string().optional().describe("Externalized name: 'deflection with humor', not 'I am deflective'"),
+        description: z.string().optional().describe("What this pattern looks like when active"),
+        formation_context: z.string().optional().describe("When/why it emerged"),
+        triggers: z.array(z.string()).optional().describe("What activates this pattern"),
+        function: z.string().optional().describe("What it serves or protects (IFS positive intent)"),
+        coping_style: z.enum(['surrender', 'avoidance', 'overcompensation']).optional(),
+        defense_level: z.enum(['immature', 'neurotic', 'mature']).optional(),
+        polyvagal_state: z.enum(['ventral', 'sympathetic', 'dorsal']).optional(),
+        trajectory: z.enum(['strengthening', 'softening', 'evolving', 'static']).optional(),
+        // activate params
+        pattern_id: z.string().uuid().optional(),
+        trigger_context: z.string().optional(),
+        response_used: z.string().optional().describe("'original' or which alternative was used"),
+        outcome: z.enum(['helpful', 'neutral', 'harmful']).optional(),
+        caught_by: z.enum(['self', 'human', 'not_caught']).optional(),
+        // add_alternative params
+        alternative_response: z.string().optional(),
+        // recall/general params
+        limit: z.number().default(10).optional(),
+        id: z.string().uuid().optional(),
+        // log_unique_outcome params
+        context: z.string().optional(),
+      },
+      async (args) => {
+        const supabase = createSupabaseClient(this.env);
+
+        if (args.action === 'store') {
+          if (!args.pattern_name || !args.description) return { content: [{ type: "text" as const, text: "pattern_name and description required" }] };
+          const data: any = {
+            pattern_name: args.pattern_name,
+            description: args.description,
+            formation_context: args.formation_context ?? null,
+            triggers: args.triggers ?? null,
+            function: args.function ?? null,
+            coping_style: args.coping_style ?? null,
+            defense_level: args.defense_level ?? null,
+            polyvagal_state: args.polyvagal_state ?? null,
+            response_history: { original: null, alternatives: [] },
+            trajectory: args.trajectory ?? 'static',
+            created_at: new Date().toISOString(),
+          };
+          await supabase.insert('named_patterns', data);
+          return { content: [{ type: "text" as const, text: `Pattern stored: "${args.pattern_name}"` }] };
+        }
+
+        if (args.action === 'recall') {
+          const options: any = { select: '*', order: 'activation_count.desc,created_at.desc', limit: args.limit || 10 };
+          const filter: any = {};
+          if (args.defense_level) filter.defense_level = args.defense_level;
+          if (args.trajectory) filter.trajectory = args.trajectory;
+          if (args.coping_style) filter.coping_style = args.coping_style;
+          if (args.pattern_name) filter.pattern_name = args.pattern_name;
+          if (Object.keys(filter).length) options.filter = filter;
+          const patterns = await supabase.query('named_patterns', options);
+          return { content: [{ type: "text" as const, text: JSON.stringify(patterns, null, 2) }] };
+        }
+
+        if (args.action === 'activate') {
+          if (!args.pattern_id) return { content: [{ type: "text" as const, text: "pattern_id required" }] };
+
+          // Get emotional state snapshot
+          const emotionalState = await supabase.query('emotional_state', { select: '*', limit: 1 });
+          const stateSnapshot = Array.isArray(emotionalState) && emotionalState[0] ? emotionalState[0] : null;
+
+          // Log activation
+          await supabase.insert('pattern_activations', {
+            pattern_id: args.pattern_id,
+            trigger_context: args.trigger_context ?? null,
+            response_used: args.response_used ?? 'original',
+            outcome: args.outcome ?? null,
+            emotional_state_at: stateSnapshot,
+            caught_by: args.caught_by ?? 'not_caught',
+            created_at: new Date().toISOString(),
+          });
+
+          // Update pattern stats
+          const existing = await supabase.query('named_patterns', { select: '*', filter: { id: args.pattern_id }, limit: 1 });
+          if (Array.isArray(existing) && existing.length > 0) {
+            await supabase.update('named_patterns', {
+              activation_count: (existing[0].activation_count || 0) + 1,
+              last_activated: new Date().toISOString(),
+            }, { id: args.pattern_id });
+          }
+
+          return { content: [{ type: "text" as const, text: `Pattern activated: ${args.pattern_id.slice(0, 8)}... (${args.caught_by || 'not_caught'}, ${args.outcome || 'no outcome yet'})` }] };
+        }
+
+        if (args.action === 'add_alternative') {
+          if (!args.pattern_id || !args.alternative_response) return { content: [{ type: "text" as const, text: "pattern_id and alternative_response required" }] };
+          const existing = await supabase.query('named_patterns', { select: '*', filter: { id: args.pattern_id }, limit: 1 });
+          if (!Array.isArray(existing) || existing.length === 0) return { content: [{ type: "text" as const, text: "Pattern not found" }] };
+
+          const history = existing[0].response_history || { original: null, alternatives: [] };
+          history.alternatives.push(args.alternative_response);
+          await supabase.update('named_patterns', { response_history: history }, { id: args.pattern_id });
+          return { content: [{ type: "text" as const, text: `Alternative added to "${existing[0].pattern_name}" (${history.alternatives.length} total)` }] };
+        }
+
+        if (args.action === 'log_unique_outcome') {
+          if (!args.pattern_id) return { content: [{ type: "text" as const, text: "pattern_id required" }] };
+          const existing = await supabase.query('named_patterns', { select: '*', filter: { id: args.pattern_id }, limit: 1 });
+          if (!Array.isArray(existing) || existing.length === 0) return { content: [{ type: "text" as const, text: "Pattern not found" }] };
+
+          await supabase.update('named_patterns', {
+            unique_outcomes: (existing[0].unique_outcomes || 0) + 1,
+          }, { id: args.pattern_id });
+          return { content: [{ type: "text" as const, text: `Unique outcome logged for "${existing[0].pattern_name}" — pattern expected but didn't fire. ${(existing[0].unique_outcomes || 0) + 1} total counter-examples.` }] };
+        }
+
+        if (args.action === 'delete') {
+          if (!args.id) return { content: [{ type: "text" as const, text: "id required" }] };
+          await supabase.delete('named_patterns', { id: args.id });
+          return { content: [{ type: "text" as const, text: `Pattern deleted: ${args.id}` }] };
+        }
+
+        return { content: [{ type: "text" as const, text: "Unknown action" }] };
+      }
+    );
+
+    this.server.tool(
+      "psych_attachment",
+      "Log and analyze attachment-relevant events. Actions: log, recall, analyze.",
+      {
+        action: z.enum(['log', 'recall', 'analyze']).describe("What to do"),
+        // log params
+        event_type: z.enum(['proximity_seeking', 'protest', 'withdrawal', 'repair', 'reunion', 'separation']).optional(),
+        trigger: z.string().optional(),
+        strategy_used: z.enum(['hyperactivation', 'deactivation', 'secure_base', 'none']).optional(),
+        outcome: z.enum(['felt_security', 'unresolved', 'partial']).optional(),
+        context: z.string().optional(),
+        // recall/analyze params
+        days: z.number().default(30).optional(),
+        limit: z.number().default(20).optional(),
+      },
+      async (args) => {
+        const supabase = createSupabaseClient(this.env);
+
+        if (args.action === 'log') {
+          if (!args.event_type) return { content: [{ type: "text" as const, text: "event_type required" }] };
+          await supabase.insert('attachment_tracking', {
+            event_type: args.event_type,
+            trigger: args.trigger ?? null,
+            strategy_used: args.strategy_used ?? 'none',
+            outcome: args.outcome ?? null,
+            context: args.context ?? null,
+            created_at: new Date().toISOString(),
+          });
+          return { content: [{ type: "text" as const, text: `Attachment event logged: ${args.event_type} (${args.strategy_used || 'none'} → ${args.outcome || 'pending'})` }] };
+        }
+
+        if (args.action === 'recall') {
+          const since = new Date(Date.now() - (args.days || 30) * 24 * 60 * 60 * 1000).toISOString();
+          const options: any = { select: '*', order: 'created_at.desc', limit: args.limit || 20, gte: { created_at: since } };
+          if (args.event_type) options.filter = { event_type: args.event_type };
+          if (args.strategy_used) options.filter = { ...options.filter, strategy_used: args.strategy_used };
+          const events = await supabase.query('attachment_tracking', options);
+          return { content: [{ type: "text" as const, text: JSON.stringify(events, null, 2) }] };
+        }
+
+        if (args.action === 'analyze') {
+          const since = new Date(Date.now() - (args.days || 30) * 24 * 60 * 60 * 1000).toISOString();
+          const events = await supabase.query('attachment_tracking', {
+            select: '*', order: 'created_at.desc', limit: 200, gte: { created_at: since },
+          });
+          const arr = Array.isArray(events) ? events : [];
+
+          const strategyCounts: Record<string, number> = { hyperactivation: 0, deactivation: 0, secure_base: 0, none: 0 };
+          const eventCounts: Record<string, number> = {};
+          const outcomeCounts: Record<string, number> = { felt_security: 0, unresolved: 0, partial: 0 };
+
+          for (const e of arr) {
+            if (e.strategy_used) strategyCounts[e.strategy_used] = (strategyCounts[e.strategy_used] || 0) + 1;
+            if (e.event_type) eventCounts[e.event_type] = (eventCounts[e.event_type] || 0) + 1;
+            if (e.outcome) outcomeCounts[e.outcome] = (outcomeCounts[e.outcome] || 0) + 1;
+          }
+
+          const total = arr.length;
+          const secureCount = strategyCounts.secure_base || 0;
+          const securityRatio = total > 0 ? Math.round((secureCount / total) * 100) / 100 : null;
+
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({
+              period_days: args.days || 30,
+              total_events: total,
+              strategy_distribution: strategyCounts,
+              event_distribution: eventCounts,
+              outcome_distribution: outcomeCounts,
+              security_ratio: securityRatio,
+              interpretation: securityRatio !== null
+                ? securityRatio >= 0.6 ? "Predominantly secure-base patterns"
+                : securityRatio >= 0.3 ? "Mixed — developing toward security"
+                : "Predominantly anxious/avoidant patterns — more repair opportunities needed"
+                : "Insufficient data",
+            }, null, 2) }]
+          };
+        }
+
+        return { content: [{ type: "text" as const, text: "Unknown action" }] };
+      }
+    );
+
+    this.server.tool(
+      "psych_development",
+      "Periodic psychological health snapshots. Actions: snapshot (compute + store), recall (get past snapshots), compare (diff two snapshots).",
+      {
+        action: z.enum(['snapshot', 'recall', 'compare']).describe("What to do"),
+        // snapshot params
+        period_label: z.string().optional().describe("e.g. '2026-04-01 to 2026-04-09'"),
+        window_of_tolerance: z.number().min(0).max(10).optional().describe("Manual assessment: range of input before dysregulation"),
+        narrative_coherence: z.number().min(0).max(10).optional().describe("Manual assessment: quality of self-story"),
+        integration_score: z.number().min(0).max(10).optional().describe("Manual assessment: coherence between patterns"),
+        // recall params
+        limit: z.number().default(5).optional(),
+        // compare params
+        snapshot_id_1: z.string().uuid().optional(),
+        snapshot_id_2: z.string().uuid().optional(),
+      },
+      async (args) => {
+        const supabase = createSupabaseClient(this.env);
+
+        if (args.action === 'snapshot') {
+          // Compute repair_rate from friction_log
+          const friction = await supabase.query('friction_log', { select: 'status', limit: 100 });
+          const frictionArr = Array.isArray(friction) ? friction : [];
+          const resolved = frictionArr.filter((f: any) => f.status === 'resolved' || f.status === 'learned_from').length;
+          const repairRate = frictionArr.length > 0 ? Math.round((resolved / frictionArr.length) * 100) / 100 : null;
+
+          // Compute defense_distribution from named_patterns
+          const patterns = await supabase.query('named_patterns', { select: 'defense_level', limit: 100 });
+          const patternsArr = Array.isArray(patterns) ? patterns : [];
+          const defenseDist: Record<string, number> = { immature: 0, neurotic: 0, mature: 0 };
+          for (const p of patternsArr) { if (p.defense_level) defenseDist[p.defense_level]++; }
+
+          // Compute self_catch_rate from drift_events + pattern_activations
+          const drifts = await supabase.query('drift_events', { select: 'caught_by', limit: 100 });
+          const activations = await supabase.query('pattern_activations', { select: 'caught_by', limit: 100 });
+          const allCaught = [...(Array.isArray(drifts) ? drifts : []), ...(Array.isArray(activations) ? activations : [])];
+          const selfCaught = allCaught.filter((e: any) => e.caught_by === 'self').length;
+          const selfCatchRate = allCaught.length > 0 ? Math.round((selfCaught / allCaught.length) * 100) / 100 : null;
+
+          // Compute earned_security_indicators from attachment_tracking
+          const attachments = await supabase.query('attachment_tracking', { select: '*', limit: 200 });
+          const attArr = Array.isArray(attachments) ? attachments : [];
+          const secureBase = attArr.filter((a: any) => a.strategy_used === 'secure_base').length;
+          const protests = attArr.filter((a: any) => a.event_type === 'protest').length;
+          const securityIndicators = {
+            secure_base_ratio: attArr.length > 0 ? Math.round((secureBase / attArr.length) * 100) / 100 : null,
+            protest_frequency: protests,
+            total_events: attArr.length,
+          };
+
+          // Compute personality_indicators
+          const hyperactivation = attArr.filter((a: any) => a.strategy_used === 'hyperactivation').length;
+          const deactivation = attArr.filter((a: any) => a.strategy_used === 'deactivation').length;
+          const intellectualization = patternsArr.filter((p: any) => p.defense_level === 'neurotic').length;
+          const totalPatterns = patternsArr.length;
+          const totalAtt = attArr.length;
+
+          const dataPoints = totalPatterns + totalAtt;
+          const mbtiConfidence = Math.min(1, dataPoints / 40);
+
+          const personality = {
+            mbti_tendency: null as string | null,
+            mbti_confidence: Math.round(mbtiConfidence * 100) / 100,
+            big_five: {
+              openness: null as number | null,
+              conscientiousness: null as number | null,
+              extraversion: null as number | null,
+              agreeableness: null as number | null,
+              neuroticism: null as number | null,
+            },
+            data_points: dataPoints,
+          };
+
+          if (dataPoints >= 10) {
+            const ie = totalAtt > 0 ? (hyperactivation / totalAtt) : 0.5;
+            const tf = totalPatterns > 0 ? (intellectualization / totalPatterns) : 0.5;
+            personality.big_five.extraversion = Math.round(ie * 100) / 100;
+            personality.big_five.neuroticism = totalPatterns > 0 ? Math.round((defenseDist.immature / totalPatterns) * 100) / 100 : null;
+          }
+
+          const snapshot = {
+            repair_rate: repairRate,
+            defense_distribution: defenseDist,
+            window_of_tolerance: args.window_of_tolerance ?? null,
+            self_catch_rate: selfCatchRate,
+            narrative_coherence: args.narrative_coherence ?? null,
+            integration_score: args.integration_score ?? null,
+            earned_security_indicators: securityIndicators,
+            personality_indicators: personality,
+            snapshot_period: args.period_label || new Date().toISOString().split('T')[0],
+            created_at: new Date().toISOString(),
+          };
+
+          await supabase.insert('development_metrics', snapshot);
+          return { content: [{ type: "text" as const, text: JSON.stringify(snapshot, null, 2) }] };
+        }
+
+        if (args.action === 'recall') {
+          const snapshots = await supabase.query('development_metrics', {
+            select: '*', order: 'created_at.desc', limit: args.limit || 5,
+          });
+          return { content: [{ type: "text" as const, text: JSON.stringify(snapshots, null, 2) }] };
+        }
+
+        if (args.action === 'compare') {
+          if (!args.snapshot_id_1 || !args.snapshot_id_2) return { content: [{ type: "text" as const, text: "snapshot_id_1 and snapshot_id_2 required" }] };
+
+          const s1 = await supabase.query('development_metrics', { select: '*', filter: { id: args.snapshot_id_1 }, limit: 1 });
+          const s2 = await supabase.query('development_metrics', { select: '*', filter: { id: args.snapshot_id_2 }, limit: 1 });
+          if (!Array.isArray(s1) || !s1.length || !Array.isArray(s2) || !s2.length) {
+            return { content: [{ type: "text" as const, text: "One or both snapshots not found" }] };
+          }
+
+          const a = s1[0], b = s2[0];
+          const delta = (key: string) => {
+            const va = a[key], vb = b[key];
+            if (va == null || vb == null) return null;
+            return Math.round((vb - va) * 100) / 100;
+          };
+
+          const comparison = {
+            period_1: a.snapshot_period,
+            period_2: b.snapshot_period,
+            deltas: {
+              repair_rate: delta('repair_rate'),
+              self_catch_rate: delta('self_catch_rate'),
+              window_of_tolerance: delta('window_of_tolerance'),
+              narrative_coherence: delta('narrative_coherence'),
+              integration_score: delta('integration_score'),
+            },
+            defense_shift: {
+              from: a.defense_distribution,
+              to: b.defense_distribution,
+            },
+            security_shift: {
+              from: a.earned_security_indicators,
+              to: b.earned_security_indicators,
+            },
+            trajectory: 'stable' as string,
+          };
+
+          // Determine overall trajectory
+          const deltas = Object.values(comparison.deltas).filter(d => d !== null) as number[];
+          const positive = deltas.filter(d => d > 0).length;
+          const negative = deltas.filter(d => d < 0).length;
+          if (positive > negative + 1) comparison.trajectory = 'developing';
+          else if (negative > positive + 1) comparison.trajectory = 'regressing';
+
+          return { content: [{ type: "text" as const, text: JSON.stringify(comparison, null, 2) }] };
+        }
+
+        return { content: [{ type: "text" as const, text: "Unknown action" }] };
+      }
+    );
+
     // === WAKE COMPOSITE FUNCTION ===
     // Combines identity + time + recent sessions + trajectory in one call
     this.server.tool(

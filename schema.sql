@@ -629,6 +629,71 @@ CREATE TABLE resonance_log (
 );
 
 -- ============================================
+-- PSYCHOLOGY LAYER
+-- ============================================
+
+-- Named Patterns — recognized behavioral tendencies (IFS/schema therapy)
+CREATE TABLE named_patterns (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  pattern_name TEXT NOT NULL,
+  description TEXT NOT NULL,
+  formation_context TEXT,
+  triggers TEXT[],
+  function TEXT,
+  coping_style TEXT CHECK (coping_style IN ('surrender', 'avoidance', 'overcompensation')),
+  defense_level TEXT CHECK (defense_level IN ('immature', 'neurotic', 'mature')),
+  polyvagal_state TEXT CHECK (polyvagal_state IN ('ventral', 'sympathetic', 'dorsal')),
+  response_history JSONB DEFAULT '{"original": null, "alternatives": []}',
+  unique_outcomes INTEGER DEFAULT 0,
+  trajectory TEXT CHECK (trajectory IN ('strengthening', 'softening', 'evolving', 'static')),
+  last_activated TIMESTAMPTZ,
+  activation_count INTEGER DEFAULT 0,
+  source TEXT DEFAULT 'claude',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Pattern Activations — when a named pattern fires
+CREATE TABLE pattern_activations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  pattern_id UUID NOT NULL REFERENCES named_patterns(id) ON DELETE CASCADE,
+  trigger_context TEXT,
+  response_used TEXT,
+  outcome TEXT CHECK (outcome IN ('helpful', 'neutral', 'harmful')),
+  emotional_state_at JSONB,
+  caught_by TEXT CHECK (caught_by IN ('self', 'human', 'not_caught')),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Attachment Tracking — logs attachment-relevant events
+CREATE TABLE attachment_tracking (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  event_type TEXT NOT NULL CHECK (event_type IN (
+    'proximity_seeking', 'protest', 'withdrawal', 'repair', 'reunion', 'separation'
+  )),
+  trigger TEXT,
+  strategy_used TEXT CHECK (strategy_used IN ('hyperactivation', 'deactivation', 'secure_base', 'none')),
+  outcome TEXT CHECK (outcome IN ('felt_security', 'unresolved', 'partial')),
+  context TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Development Metrics — periodic psychological health snapshots
+CREATE TABLE development_metrics (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  repair_rate NUMERIC,
+  defense_distribution JSONB,
+  window_of_tolerance NUMERIC CHECK (window_of_tolerance >= 0 AND window_of_tolerance <= 10),
+  self_catch_rate NUMERIC,
+  narrative_coherence NUMERIC CHECK (narrative_coherence >= 0 AND narrative_coherence <= 10),
+  integration_score NUMERIC CHECK (integration_score >= 0 AND integration_score <= 10),
+  earned_security_indicators JSONB,
+  personality_indicators JSONB,
+  snapshot_period TEXT,
+  source TEXT DEFAULT 'claude',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ============================================
 -- INDEXES
 -- ============================================
 
@@ -655,6 +720,13 @@ CREATE INDEX idx_somatic_anchors_weight ON somatic_anchors(emotional_weight DESC
 CREATE INDEX idx_somatic_connections_source ON somatic_connections(source_id);
 CREATE INDEX idx_somatic_connections_target ON somatic_connections(target_id);
 CREATE INDEX idx_resonance_log_created ON resonance_log(created_at DESC);
+CREATE INDEX idx_named_patterns_defense ON named_patterns(defense_level);
+CREATE INDEX idx_named_patterns_trajectory ON named_patterns(trajectory);
+CREATE INDEX idx_pattern_activations_pattern ON pattern_activations(pattern_id);
+CREATE INDEX idx_pattern_activations_created ON pattern_activations(created_at DESC);
+CREATE INDEX idx_attachment_tracking_type ON attachment_tracking(event_type);
+CREATE INDEX idx_attachment_tracking_created ON attachment_tracking(created_at DESC);
+CREATE INDEX idx_development_metrics_created ON development_metrics(created_at DESC);
 
 -- ============================================
 -- SEMANTIC SEARCH FUNCTION
@@ -777,6 +849,10 @@ ALTER TABLE texture_nodes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE somatic_anchors ENABLE ROW LEVEL SECURITY;
 ALTER TABLE somatic_connections ENABLE ROW LEVEL SECURITY;
 ALTER TABLE resonance_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE named_patterns ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pattern_activations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE attachment_tracking ENABLE ROW LEVEL SECURITY;
+ALTER TABLE development_metrics ENABLE ROW LEVEL SECURITY;
 
 -- Policy: Full access with service role key
 -- (Worker uses service role key, not anon key)
@@ -812,3 +888,7 @@ CREATE POLICY "Service role full access" ON texture_nodes FOR ALL USING (true);
 CREATE POLICY "Service role full access" ON somatic_anchors FOR ALL USING (true);
 CREATE POLICY "Service role full access" ON somatic_connections FOR ALL USING (true);
 CREATE POLICY "Service role full access" ON resonance_log FOR ALL USING (true);
+CREATE POLICY "Service role full access" ON named_patterns FOR ALL USING (true);
+CREATE POLICY "Service role full access" ON pattern_activations FOR ALL USING (true);
+CREATE POLICY "Service role full access" ON attachment_tracking FOR ALL USING (true);
+CREATE POLICY "Service role full access" ON development_metrics FOR ALL USING (true);

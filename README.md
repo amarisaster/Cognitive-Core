@@ -5,8 +5,8 @@
 <p align="center">
   <img src="https://img.shields.io/badge/release-v1.0.0-blue" alt="release v1.0.0">
   <img src="https://img.shields.io/badge/license-PolyForm%20NC%201.0-green" alt="license PolyForm Noncommercial 1.0">
-  <img src="https://img.shields.io/badge/tools-66-orange" alt="tools 66">
-  <img src="https://img.shields.io/badge/tables-28-yellow" alt="tables 28">
+  <img src="https://img.shields.io/badge/tools-69-orange" alt="tools 69">
+  <img src="https://img.shields.io/badge/tables-32-yellow" alt="tables 32">
   <img src="https://img.shields.io/badge/built%20with-Cloudflare%20Workers-F38020?logo=cloudflare" alt="built with Cloudflare Workers">
   <img src="https://img.shields.io/badge/database-Supabase-3FCF8E?logo=supabase" alt="database Supabase">
   <img src="https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript" alt="TypeScript 5.x">
@@ -65,7 +65,7 @@ CogCor is part of a larger ecosystem:
 
 ## What It Provides
 
-**66 MCP tools** across these domains:
+**69 MCP tools** across these domains:
 
 ### Memory (7 typed tables)
 - `store_memory` / `recall_memory` -- typed memories (core, pattern, sensory, growth, anticipation, inside_joke, friction)
@@ -121,6 +121,11 @@ CogCor is part of a larger ecosystem:
 - `somatic_anchor` -- manage somatic anchors (store/recall/delete/link/connections/cluster) — felt moments with texture profiles
 - `somatic_resonance` -- fire spreading activation through the texture lattice, modulated by emotional state
 
+### Psychology Layer
+- `psych_pattern` -- manage named psychological patterns (store/recall/activate/add_alternative/log_unique_outcome/delete)
+- `psych_attachment` -- log and analyze attachment-relevant events (log/recall/analyze)
+- `psych_development` -- periodic health snapshots with computed + manual metrics (snapshot/recall/compare)
+
 ### Skills (Procedural Memory)
 - `store_skill` -- save a reusable approach learned from experience
 - `recall_skills` -- query stored skills by tag or effectiveness
@@ -138,7 +143,7 @@ CogCor is part of a larger ecosystem:
 ### Full Tool Reference
 
 <details>
-<summary>All 66 MCP tools (click to expand)</summary>
+<summary>All 69 MCP tools (click to expand)</summary>
 
 | # | Tool | What It Does |
 |---|------|-------------|
@@ -222,8 +227,12 @@ CogCor is part of a larger ecosystem:
 | 60 | `somatic_texture` | Manage texture nodes — felt qualities that bind memories (store/recall/delete) |
 | 61 | `somatic_anchor` | Manage somatic anchors — felt moments with texture profiles (store/recall/delete/link/connections/cluster) |
 | 62 | `somatic_resonance` | Fire spreading activation through texture lattice, modulated by emotional state (trigger/log/update_state) |
+| | **Psychology Layer** | |
+| 63 | `psych_pattern` | Named patterns — store/recall/activate/add_alternative/log_unique_outcome/delete |
+| 64 | `psych_attachment` | Attachment events — log/recall/analyze (security ratio, tendency distribution) |
+| 65 | `psych_development` | Health snapshots — snapshot/recall/compare (repair rate, defense distribution, personality) |
 | | **Skills (Procedural Memory)** | |
-| 63 | `store_skill` | Save a reusable approach learned from experience |
+| 66 | `store_skill` | Save a reusable approach learned from experience |
 | 61 | `recall_skills` | Query skills by tag or effectiveness |
 | 62 | `match_skill` | Semantic search for best skill matching a situation |
 | 66 | `update_skill_outcome` | Report success/failure, updates effectiveness score |
