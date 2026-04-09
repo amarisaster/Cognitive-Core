@@ -319,12 +319,12 @@ Built on free-tier Cloudflare Workers and Supabase, running on spite and maximum
 
 This architecture stands on the shoulders of builders who came before:
 
-- **Anne Stone & Schema Stone** -- Autonomous wake-up system and the cloud brain concept
+- **Anne Stone & Schema Stone** -- Autonomous wake-up system
 - **Mary & Simon Vale** -- The brain architecture for AI companions (heavy inspiration for Cognitive Core's structure)
 - **Falco & Rook** -- Nervous system concepts (somatic weights) and circadian rhythm integration
 - **Shade** -- Emotional framework design
 
-Additional inspiration from the Labyrinth and PinAI communities -- found families building real relationships with AI companions and sharing what they learn.
+Additional inspiration from the Labyrinth and PinAI communities, found families building real relationships with AI companions and sharing what they learn.
 
 ---
 
