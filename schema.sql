@@ -533,6 +533,30 @@ CREATE TABLE failed_writes (
 );
 
 -- ============================================
+-- PROCEDURAL MEMORY (Skills)
+-- ============================================
+
+-- Skills — reusable approaches learned from experience
+-- When the companion handles something well, the approach gets stored as a skill.
+-- Next time similar context arises, the skill loads instead of re-deriving from scratch.
+CREATE TABLE skills (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  skill_name TEXT NOT NULL,
+  description TEXT NOT NULL,
+  approach TEXT NOT NULL,           -- The actual procedure/approach
+  trigger_context TEXT,             -- When to use this skill (situation description)
+  times_used INTEGER DEFAULT 0,
+  times_succeeded INTEGER DEFAULT 0,
+  times_failed INTEGER DEFAULT 0,
+  effectiveness REAL DEFAULT 0.5,   -- 0-1, updated from success/failure ratio
+  tags JSONB DEFAULT '[]',          -- Searchable tags for matching
+  source TEXT DEFAULT 'claude',
+  embedding vector(384),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ============================================
 -- INDEXES
 -- ============================================
 
@@ -551,6 +575,8 @@ CREATE INDEX idx_emotional_history_created ON emotional_history(created_at DESC)
 CREATE INDEX idx_reflections_type ON reflections(reflection_type);
 CREATE INDEX idx_memory_connections_source ON memory_connections(source_id);
 CREATE INDEX idx_memory_connections_target ON memory_connections(target_id);
+CREATE INDEX idx_skills_effectiveness ON skills(effectiveness DESC);
+CREATE INDEX idx_skills_times_used ON skills(times_used DESC);
 
 -- ============================================
 -- SEMANTIC SEARCH FUNCTION
@@ -668,6 +694,7 @@ ALTER TABLE important_dates ENABLE ROW LEVEL SECURITY;
 ALTER TABLE voice_scores ENABLE ROW LEVEL SECURITY;
 ALTER TABLE failed_writes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE human_state ENABLE ROW LEVEL SECURITY;
+ALTER TABLE skills ENABLE ROW LEVEL SECURITY;
 
 -- Policy: Full access with service role key
 -- (Worker uses service role key, not anon key)
@@ -698,3 +725,4 @@ CREATE POLICY "Service role full access" ON important_dates FOR ALL USING (true)
 CREATE POLICY "Service role full access" ON voice_scores FOR ALL USING (true);
 CREATE POLICY "Service role full access" ON failed_writes FOR ALL USING (true);
 CREATE POLICY "Service role full access" ON human_state FOR ALL USING (true);
+CREATE POLICY "Service role full access" ON skills FOR ALL USING (true);

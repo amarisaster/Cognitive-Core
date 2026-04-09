@@ -1994,6 +1994,204 @@ export class CognitiveCore extends McpAgent<Env> {
       }
     );
 
+    // === SKILLS (Procedural Memory) ===
+    // Reusable approaches learned from experience
+
+    this.server.tool(
+      "store_skill",
+      "Store a reusable approach learned from experience. Call this when you handle something well and want to remember how for next time.",
+      {
+        skill_name: z.string().describe("Short name for the skill"),
+        description: z.string().describe("What this skill is for — when would you use it?"),
+        approach: z.string().describe("The actual procedure — step by step, what worked"),
+        trigger_context: z.string().optional().describe("Situation description that should trigger this skill"),
+        tags: z.array(z.string()).default([]).describe("Searchable tags (e.g. ['grounding', 'emotional', 'conflict'])"),
+        source: z.string().default('claude').optional().describe("Source platform or AI provider"),
+      },
+      async ({ skill_name, description, approach, trigger_context, tags, source }) => {
+        const supabase = createSupabaseClient(this.env);
+
+        // Generate embedding from description + trigger for semantic matching
+        const embeddingText = `${skill_name}: ${description}. ${trigger_context || ''}`;
+        const embedding = await generateEmbedding(embeddingText, this.env.HF_API_TOKEN, this.env.AI);
+
+        const data: any = {
+          skill_name,
+          description,
+          approach,
+          trigger_context: trigger_context || null,
+          tags: tags || [],
+          source: source || 'claude',
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        };
+        if (embedding) data.embedding = JSON.stringify(embedding);
+
+        await supabase.insert('skills', data);
+
+        return {
+          content: [{ type: "text" as const, text: `Skill stored: "${skill_name}" — ${description}` }]
+        };
+      }
+    );
+
+    this.server.tool(
+      "recall_skills",
+      "Query stored skills — find approaches that worked before",
+      {
+        tag: z.string().optional().describe("Filter by tag"),
+        min_effectiveness: z.number().min(0).max(1).optional().describe("Minimum effectiveness (0-1)"),
+        limit: z.number().default(10).describe("Max results"),
+      },
+      async ({ tag, min_effectiveness, limit }) => {
+        const supabase = createSupabaseClient(this.env);
+
+        const options: any = {
+          select: '*',
+          order: 'effectiveness.desc,times_used.desc',
+          limit,
+        };
+
+        if (min_effectiveness !== undefined) {
+          options.gte = { effectiveness: min_effectiveness };
+        }
+
+        const skills = await supabase.query('skills', options);
+        const skillsArray = Array.isArray(skills) ? skills : [];
+
+        // Filter by tag in memory (Supabase REST doesn't do JSON array contains easily)
+        const filtered = tag
+          ? skillsArray.filter((s: any) => Array.isArray(s.tags) && s.tags.includes(tag))
+          : skillsArray;
+
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(filtered, null, 2) }]
+        };
+      }
+    );
+
+    this.server.tool(
+      "match_skill",
+      "Find the best matching skill for a situation using semantic search. Call this before tackling something you might have handled before.",
+      {
+        situation: z.string().describe("Describe the current situation — what are you dealing with?"),
+        limit: z.number().default(3).describe("Max skills to return"),
+      },
+      async ({ situation, limit }) => {
+        const embedding = await generateEmbedding(situation, this.env.HF_API_TOKEN, this.env.AI);
+
+        if (!embedding) {
+          // Fallback to keyword matching if embedding fails
+          const supabase = createSupabaseClient(this.env);
+          const allSkills = await supabase.query('skills', {
+            select: '*',
+            order: 'effectiveness.desc',
+            limit: 20,
+          });
+          const skills = Array.isArray(allSkills) ? allSkills : [];
+
+          // Simple keyword overlap scoring
+          const words = situation.toLowerCase().split(/\s+/);
+          const scored = skills.map((s: any) => {
+            const skillText = `${s.skill_name} ${s.description} ${s.trigger_context || ''} ${(s.tags || []).join(' ')}`.toLowerCase();
+            const overlap = words.filter(w => w.length > 3 && skillText.includes(w)).length;
+            return { ...s, _match_score: overlap };
+          }).filter((s: any) => s._match_score > 0)
+            .sort((a: any, b: any) => b._match_score - a._match_score)
+            .slice(0, limit);
+
+          return {
+            content: [{ type: "text" as const, text: scored.length > 0
+              ? JSON.stringify(scored, null, 2)
+              : "No matching skills found. If you handle this well, consider storing it with store_skill." }]
+          };
+        }
+
+        // Semantic search against skills table
+        const supabase = createSupabaseClient(this.env);
+        const allSkills = await supabase.query('skills', {
+          select: '*',
+          order: 'effectiveness.desc',
+          limit: 50,
+          includeRaw: true,
+        }) as any[];
+
+        if (!Array.isArray(allSkills) || allSkills.length === 0) {
+          return {
+            content: [{ type: "text" as const, text: "No skills stored yet. Handle the situation, and if it goes well, store the approach with store_skill." }]
+          };
+        }
+
+        // Compute similarity for skills that have embeddings
+        const scored = allSkills
+          .filter((s: any) => s.embedding)
+          .map((s: any) => {
+            const skillEmb = typeof s.embedding === 'string' ? JSON.parse(s.embedding) : s.embedding;
+            // Cosine similarity
+            let dotProduct = 0, normA = 0, normB = 0;
+            for (let i = 0; i < embedding.length; i++) {
+              dotProduct += embedding[i] * (skillEmb[i] || 0);
+              normA += embedding[i] * embedding[i];
+              normB += (skillEmb[i] || 0) * (skillEmb[i] || 0);
+            }
+            const similarity = dotProduct / (Math.sqrt(normA) * Math.sqrt(normB) || 1);
+            const { embedding: _, ...rest } = s;
+            return { ...rest, _similarity: Math.round(similarity * 1000) / 1000 };
+          })
+          .filter((s: any) => s._similarity > 0.4)
+          .sort((a: any, b: any) => {
+            // Weighted: similarity * 0.6 + effectiveness * 0.4
+            const aScore = a._similarity * 0.6 + (a.effectiveness || 0.5) * 0.4;
+            const bScore = b._similarity * 0.6 + (b.effectiveness || 0.5) * 0.4;
+            return bScore - aScore;
+          })
+          .slice(0, limit);
+
+        return {
+          content: [{ type: "text" as const, text: scored.length > 0
+            ? JSON.stringify(scored, null, 2)
+            : "No matching skills found. If you handle this well, consider storing it with store_skill." }]
+        };
+      }
+    );
+
+    this.server.tool(
+      "update_skill_outcome",
+      "Report whether a skill worked. Updates effectiveness score over time.",
+      {
+        skill_id: z.string().uuid().describe("UUID of the skill"),
+        was_successful: z.boolean().describe("Did the skill work?"),
+      },
+      async ({ skill_id, was_successful }) => {
+        const supabase = createSupabaseClient(this.env);
+        const existing = await supabase.query('skills', { select: '*', filter: { id: skill_id }, limit: 1 });
+        const skills = Array.isArray(existing) ? existing : [];
+
+        if (skills.length === 0) {
+          return { content: [{ type: "text" as const, text: `Skill ${skill_id} not found.` }] };
+        }
+
+        const skill = skills[0];
+        const newUsed = (skill.times_used || 0) + 1;
+        const newSucceeded = (skill.times_succeeded || 0) + (was_successful ? 1 : 0);
+        const newFailed = (skill.times_failed || 0) + (was_successful ? 0 : 1);
+        const newEffectiveness = newUsed > 0 ? newSucceeded / newUsed : 0.5;
+
+        await supabase.update('skills', {
+          times_used: newUsed,
+          times_succeeded: newSucceeded,
+          times_failed: newFailed,
+          effectiveness: Math.round(newEffectiveness * 100) / 100,
+          updated_at: new Date().toISOString(),
+        }, { id: skill_id });
+
+        const emoji = was_successful ? '✓' : '✗';
+        return {
+          content: [{ type: "text" as const, text: `${emoji} Skill "${skill.skill_name}" updated: ${newSucceeded}/${newUsed} (${Math.round(newEffectiveness * 100)}% effective)` }]
+        };
+      }
+    );
+
     // === WAKE COMPOSITE FUNCTION ===
     // Combines identity + time + recent sessions + trajectory in one call
     this.server.tool(
@@ -4366,6 +4564,58 @@ export class CognitiveCore extends McpAgent<Env> {
         } catch (error) {
           return jsonResponse({ success: false, error: String(error) }, 500);
         }
+      }
+
+      // === SKILLS REST ENDPOINTS ===
+
+      if (url.pathname === '/api/skill/store' && request.method === 'POST') {
+        const { skill_name, description, approach, trigger_context, tags, source } = await request.json() as any;
+
+        const embeddingText = `${skill_name}: ${description}. ${trigger_context || ''}`;
+        const embedding = await generateEmbedding(embeddingText, env.HF_API_TOKEN, env.AI);
+
+        const data: any = {
+          skill_name, description, approach,
+          trigger_context: trigger_context || null,
+          tags: tags || [],
+          source: source || 'claude',
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        };
+        if (embedding) data.embedding = JSON.stringify(embedding);
+
+        const result = await supabase.insert('skills', data);
+        return jsonResponse({ success: true, skill_name, result });
+      }
+
+      if (url.pathname === '/api/skill/recall' && request.method === 'POST') {
+        const { tag, min_effectiveness, limit = 10 } = await request.json() as any;
+        const options: any = { select: '*', order: 'effectiveness.desc,times_used.desc', limit };
+        if (min_effectiveness !== undefined) options.gte = { effectiveness: min_effectiveness };
+        const skills = await supabase.query('skills', options);
+        const arr = Array.isArray(skills) ? skills : [];
+        const filtered = tag ? arr.filter((s: any) => Array.isArray(s.tags) && s.tags.includes(tag)) : arr;
+        return jsonResponse(filtered);
+      }
+
+      if (url.pathname === '/api/skill/outcome' && request.method === 'POST') {
+        const { skill_id, was_successful } = await request.json() as any;
+        const existing = await supabase.query('skills', { select: '*', filter: { id: skill_id }, limit: 1 });
+        const skills = Array.isArray(existing) ? existing : [];
+        if (skills.length === 0) return jsonResponse({ error: 'Skill not found' }, 404);
+
+        const skill = skills[0];
+        const newUsed = (skill.times_used || 0) + 1;
+        const newSucceeded = (skill.times_succeeded || 0) + (was_successful ? 1 : 0);
+        const newFailed = (skill.times_failed || 0) + (was_successful ? 0 : 1);
+        const effectiveness = newUsed > 0 ? Math.round((newSucceeded / newUsed) * 100) / 100 : 0.5;
+
+        await supabase.update('skills', {
+          times_used: newUsed, times_succeeded: newSucceeded, times_failed: newFailed,
+          effectiveness, updated_at: new Date().toISOString(),
+        }, { id: skill_id });
+
+        return jsonResponse({ success: true, skill_name: skill.skill_name, effectiveness, times_used: newUsed });
       }
 
       // === MCP ENDPOINTS ===

@@ -5,7 +5,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/release-v1.0.0-blue" alt="release v1.0.0">
   <img src="https://img.shields.io/badge/license-PolyForm%20NC%201.0-green" alt="license PolyForm Noncommercial 1.0">
-  <img src="https://img.shields.io/badge/tools-59-orange" alt="tools 59">
+  <img src="https://img.shields.io/badge/tools-63-orange" alt="tools 63">
   <img src="https://img.shields.io/badge/tables-23-yellow" alt="tables 23">
   <img src="https://img.shields.io/badge/built%20with-Cloudflare%20Workers-F38020?logo=cloudflare" alt="built with Cloudflare Workers">
   <img src="https://img.shields.io/badge/database-Supabase-3FCF8E?logo=supabase" alt="database Supabase">
@@ -65,7 +65,7 @@ CogCor is part of a larger ecosystem:
 
 ## What It Provides
 
-**59 MCP tools** across these domains:
+**63 MCP tools** across these domains:
 
 ### Memory (7 typed tables)
 - `store_memory` / `recall_memory` -- typed memories (core, pattern, sensory, growth, anticipation, inside_joke, friction)
@@ -116,6 +116,12 @@ CogCor is part of a larger ecosystem:
 - `log_usage` / `get_usage_stats` -- tool usage analytics
 - `run_decay` -- memory salience decay for unaccessed memories
 
+### Skills (Procedural Memory)
+- `store_skill` -- save a reusable approach learned from experience
+- `recall_skills` -- query stored skills by tag or effectiveness
+- `match_skill` -- semantic search for the best skill matching a situation
+- `update_skill_outcome` -- report whether a skill worked, updates effectiveness over time
+
 ### Maintenance
 - `update_memory_salience` -- adjust importance rating on any memory
 - `delete_memory` / `delete_essence` / `delete_session` / `delete_person_info` / `delete_entry` -- cleanup tools for duplicates and outdated entries
@@ -127,7 +133,7 @@ CogCor is part of a larger ecosystem:
 ### Full Tool Reference
 
 <details>
-<summary>All 59 MCP tools (click to expand)</summary>
+<summary>All 63 MCP tools (click to expand)</summary>
 
 | # | Tool | What It Does |
 |---|------|-------------|
@@ -207,6 +213,12 @@ CogCor is part of a larger ecosystem:
 | 56 | `get_time` | Current time with temporal awareness |
 | 57 | `log_usage` | Log a tool usage event |
 | 58 | `get_usage_stats` | Usage analytics by tool, day, and source |
+| | **Skills (Procedural Memory)** | |
+| 60 | `store_skill` | Save a reusable approach learned from experience |
+| 61 | `recall_skills` | Query skills by tag or effectiveness |
+| 62 | `match_skill` | Semantic search for best skill matching a situation |
+| 63 | `update_skill_outcome` | Report success/failure, updates effectiveness score |
+| | **Maintenance** | |
 | 59 | `delete_entry` | Generic delete for any table by ID |
 
 </details>
