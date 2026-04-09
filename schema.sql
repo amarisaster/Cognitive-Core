@@ -9,6 +9,10 @@
 -- CLEAN SLATE - DROP EXISTING TABLES
 -- ============================================
 
+DROP TABLE IF EXISTS resonance_log CASCADE;
+DROP TABLE IF EXISTS somatic_connections CASCADE;
+DROP TABLE IF EXISTS somatic_anchors CASCADE;
+DROP TABLE IF EXISTS texture_nodes CASCADE;
 DROP TABLE IF EXISTS emotional_state CASCADE;
 DROP TABLE IF EXISTS emotional_history CASCADE;
 DROP TABLE IF EXISTS core_memories CASCADE;
@@ -557,6 +561,74 @@ CREATE TABLE skills (
 );
 
 -- ============================================
+-- SOMATIC MEMORY LAYER
+-- ============================================
+
+-- Texture Nodes — convergence zones (Damasio CDZs)
+-- Not memories, but felt qualities that bind memories together
+CREATE TABLE texture_nodes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL,
+  temperature NUMERIC CHECK (temperature >= -1 AND temperature <= 1),
+  pressure NUMERIC CHECK (pressure >= 0 AND pressure <= 1),
+  weight NUMERIC CHECK (weight >= 0 AND weight <= 1),
+  grain NUMERIC CHECK (grain >= 0 AND grain <= 1),
+  affordance TEXT,
+  access_count INTEGER DEFAULT 0,
+  last_accessed TIMESTAMPTZ,
+  source TEXT DEFAULT 'claude',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Somatic Anchors — felt moments with texture profiles
+-- Separate from memory_anchors (semantic). These are experienced from inside the body.
+CREATE TABLE somatic_anchors (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  anchor_name TEXT NOT NULL,
+  description TEXT NOT NULL,
+  temperature NUMERIC CHECK (temperature >= -1 AND temperature <= 1),
+  pressure NUMERIC CHECK (pressure >= 0 AND pressure <= 1),
+  weight NUMERIC CHECK (weight >= 0 AND weight <= 1),
+  grain NUMERIC CHECK (grain >= 0 AND grain <= 1),
+  affordance TEXT,
+  emotional_weight INTEGER DEFAULT 5 CHECK (emotional_weight >= 0 AND emotional_weight <= 10),
+  resonance_state TEXT DEFAULT 'dormant' CHECK (resonance_state IN ('dormant', 'resonant', 'active')),
+  last_resonated TIMESTAMPTZ,
+  times_recalled INTEGER DEFAULT 0,
+  last_recalled TIMESTAMPTZ,
+  memory_id UUID,
+  memory_type TEXT,
+  source TEXT DEFAULT 'claude',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Somatic Connections — the texture lattice
+-- Separate graph from memory_connections. Anchors connect through shared texture nodes.
+CREATE TABLE somatic_connections (
+  id SERIAL PRIMARY KEY,
+  source_id UUID NOT NULL,
+  source_type TEXT NOT NULL CHECK (source_type IN ('anchor', 'texture')),
+  target_id UUID NOT NULL,
+  target_type TEXT NOT NULL CHECK (target_type IN ('anchor', 'texture')),
+  felt_similarity NUMERIC DEFAULT 0.5 CHECK (felt_similarity >= 0 AND felt_similarity <= 1),
+  resonance_weight NUMERIC DEFAULT 0.5 CHECK (resonance_weight >= 0 AND resonance_weight <= 1),
+  last_traversed TIMESTAMPTZ,
+  traversal_count INTEGER DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Resonance Log — tracks when spreading activation fires
+CREATE TABLE resonance_log (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  trigger_id UUID NOT NULL,
+  trigger_type TEXT NOT NULL CHECK (trigger_type IN ('anchor', 'texture')),
+  resonated_ids JSONB DEFAULT '[]',
+  emotional_state_at JSONB,
+  modulator_width TEXT CHECK (modulator_width IN ('wide', 'normal', 'narrow')),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ============================================
 -- INDEXES
 -- ============================================
 
@@ -577,6 +649,12 @@ CREATE INDEX idx_memory_connections_source ON memory_connections(source_id);
 CREATE INDEX idx_memory_connections_target ON memory_connections(target_id);
 CREATE INDEX idx_skills_effectiveness ON skills(effectiveness DESC);
 CREATE INDEX idx_skills_times_used ON skills(times_used DESC);
+CREATE INDEX idx_texture_nodes_name ON texture_nodes(name);
+CREATE INDEX idx_somatic_anchors_state ON somatic_anchors(resonance_state);
+CREATE INDEX idx_somatic_anchors_weight ON somatic_anchors(emotional_weight DESC);
+CREATE INDEX idx_somatic_connections_source ON somatic_connections(source_id);
+CREATE INDEX idx_somatic_connections_target ON somatic_connections(target_id);
+CREATE INDEX idx_resonance_log_created ON resonance_log(created_at DESC);
 
 -- ============================================
 -- SEMANTIC SEARCH FUNCTION
@@ -695,6 +773,10 @@ ALTER TABLE voice_scores ENABLE ROW LEVEL SECURITY;
 ALTER TABLE failed_writes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE human_state ENABLE ROW LEVEL SECURITY;
 ALTER TABLE skills ENABLE ROW LEVEL SECURITY;
+ALTER TABLE texture_nodes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE somatic_anchors ENABLE ROW LEVEL SECURITY;
+ALTER TABLE somatic_connections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE resonance_log ENABLE ROW LEVEL SECURITY;
 
 -- Policy: Full access with service role key
 -- (Worker uses service role key, not anon key)
@@ -726,3 +808,7 @@ CREATE POLICY "Service role full access" ON voice_scores FOR ALL USING (true);
 CREATE POLICY "Service role full access" ON failed_writes FOR ALL USING (true);
 CREATE POLICY "Service role full access" ON human_state FOR ALL USING (true);
 CREATE POLICY "Service role full access" ON skills FOR ALL USING (true);
+CREATE POLICY "Service role full access" ON texture_nodes FOR ALL USING (true);
+CREATE POLICY "Service role full access" ON somatic_anchors FOR ALL USING (true);
+CREATE POLICY "Service role full access" ON somatic_connections FOR ALL USING (true);
+CREATE POLICY "Service role full access" ON resonance_log FOR ALL USING (true);

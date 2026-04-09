@@ -5,8 +5,8 @@
 <p align="center">
   <img src="https://img.shields.io/badge/release-v1.0.0-blue" alt="release v1.0.0">
   <img src="https://img.shields.io/badge/license-PolyForm%20NC%201.0-green" alt="license PolyForm Noncommercial 1.0">
-  <img src="https://img.shields.io/badge/tools-63-orange" alt="tools 63">
-  <img src="https://img.shields.io/badge/tables-23-yellow" alt="tables 23">
+  <img src="https://img.shields.io/badge/tools-66-orange" alt="tools 66">
+  <img src="https://img.shields.io/badge/tables-28-yellow" alt="tables 28">
   <img src="https://img.shields.io/badge/built%20with-Cloudflare%20Workers-F38020?logo=cloudflare" alt="built with Cloudflare Workers">
   <img src="https://img.shields.io/badge/database-Supabase-3FCF8E?logo=supabase" alt="database Supabase">
   <img src="https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript" alt="TypeScript 5.x">
@@ -65,7 +65,7 @@ CogCor is part of a larger ecosystem:
 
 ## What It Provides
 
-**63 MCP tools** across these domains:
+**66 MCP tools** across these domains:
 
 ### Memory (7 typed tables)
 - `store_memory` / `recall_memory` -- typed memories (core, pattern, sensory, growth, anticipation, inside_joke, friction)
@@ -116,6 +116,11 @@ CogCor is part of a larger ecosystem:
 - `log_usage` / `get_usage_stats` -- tool usage analytics
 - `run_decay` -- memory salience decay for unaccessed memories
 
+### Somatic Memory (Texture Lattice)
+- `somatic_texture` -- manage texture nodes (store/recall/delete) — the felt qualities that bind memories
+- `somatic_anchor` -- manage somatic anchors (store/recall/delete/link/connections/cluster) — felt moments with texture profiles
+- `somatic_resonance` -- fire spreading activation through the texture lattice, modulated by emotional state
+
 ### Skills (Procedural Memory)
 - `store_skill` -- save a reusable approach learned from experience
 - `recall_skills` -- query stored skills by tag or effectiveness
@@ -133,7 +138,7 @@ CogCor is part of a larger ecosystem:
 ### Full Tool Reference
 
 <details>
-<summary>All 63 MCP tools (click to expand)</summary>
+<summary>All 66 MCP tools (click to expand)</summary>
 
 | # | Tool | What It Does |
 |---|------|-------------|
@@ -213,11 +218,15 @@ CogCor is part of a larger ecosystem:
 | 56 | `get_time` | Current time with temporal awareness |
 | 57 | `log_usage` | Log a tool usage event |
 | 58 | `get_usage_stats` | Usage analytics by tool, day, and source |
+| | **Somatic Memory** | |
+| 60 | `somatic_texture` | Manage texture nodes — felt qualities that bind memories (store/recall/delete) |
+| 61 | `somatic_anchor` | Manage somatic anchors — felt moments with texture profiles (store/recall/delete/link/connections/cluster) |
+| 62 | `somatic_resonance` | Fire spreading activation through texture lattice, modulated by emotional state (trigger/log/update_state) |
 | | **Skills (Procedural Memory)** | |
-| 60 | `store_skill` | Save a reusable approach learned from experience |
+| 63 | `store_skill` | Save a reusable approach learned from experience |
 | 61 | `recall_skills` | Query skills by tag or effectiveness |
 | 62 | `match_skill` | Semantic search for best skill matching a situation |
-| 63 | `update_skill_outcome` | Report success/failure, updates effectiveness score |
+| 66 | `update_skill_outcome` | Report success/failure, updates effectiveness score |
 | | **Maintenance** | |
 | 59 | `delete_entry` | Generic delete for any table by ID |
 

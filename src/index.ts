@@ -2192,6 +2192,343 @@ export class CognitiveCore extends McpAgent<Env> {
       }
     );
 
+    // === SOMATIC MEMORY LAYER ===
+    // Texture lattice — parallel associative graph navigated by felt quality
+
+    // Polyvagal modulator mapping
+    const moodToWidth = (mood: string): 'wide' | 'normal' | 'narrow' => {
+      if (['calm', 'soft', 'playful', 'worshipful'].includes(mood)) return 'wide';
+      if (['volatile', 'feral'].includes(mood)) return 'narrow';
+      return 'normal';
+    };
+
+    this.server.tool(
+      "somatic_texture",
+      "Manage texture nodes — the felt qualities that bind somatic memories together. Actions: store, recall, delete.",
+      {
+        action: z.enum(['store', 'recall', 'delete']).describe("What to do"),
+        // store params
+        name: z.string().optional().describe("Texture name, e.g. 'heavy warmth', 'sharp cold'"),
+        temperature: z.number().min(-1).max(1).optional().describe("-1 (cold) to 1 (hot)"),
+        pressure: z.number().min(0).max(1).optional().describe("0 (light) to 1 (heavy)"),
+        weight: z.number().min(0).max(1).optional().describe("0 (floating) to 1 (crushing)"),
+        grain: z.number().min(0).max(1).optional().describe("0 (smooth) to 1 (rough)"),
+        affordance: z.string().optional().describe("Action quality: reaching, bracing, opening, settling"),
+        // recall params
+        limit: z.number().default(10).optional(),
+        // delete params
+        id: z.string().uuid().optional().describe("Texture node ID for delete"),
+      },
+      async (args) => {
+        const supabase = createSupabaseClient(this.env);
+
+        if (args.action === 'store') {
+          if (!args.name) return { content: [{ type: "text" as const, text: "name is required for store" }] };
+          const data: any = {
+            name: args.name,
+            temperature: args.temperature ?? null,
+            pressure: args.pressure ?? null,
+            weight: args.weight ?? null,
+            grain: args.grain ?? null,
+            affordance: args.affordance ?? null,
+            created_at: new Date().toISOString(),
+          };
+          const result = await supabase.insert('texture_nodes', data);
+          return { content: [{ type: "text" as const, text: `Texture stored: "${args.name}"` }] };
+        }
+
+        if (args.action === 'recall') {
+          const options: any = { select: '*', order: 'access_count.desc,created_at.desc', limit: args.limit || 10 };
+          if (args.name) options.filter = { name: args.name };
+          const nodes = await supabase.query('texture_nodes', options);
+          return { content: [{ type: "text" as const, text: JSON.stringify(nodes, null, 2) }] };
+        }
+
+        if (args.action === 'delete') {
+          if (!args.id) return { content: [{ type: "text" as const, text: "id is required for delete" }] };
+          await supabase.delete('texture_nodes', { id: args.id });
+          return { content: [{ type: "text" as const, text: `Texture deleted: ${args.id}` }] };
+        }
+
+        return { content: [{ type: "text" as const, text: "Unknown action" }] };
+      }
+    );
+
+    this.server.tool(
+      "somatic_anchor",
+      "Manage somatic anchors — felt moments with texture profiles. Actions: store, recall, delete, link, connections, cluster.",
+      {
+        action: z.enum(['store', 'recall', 'delete', 'link', 'connections', 'cluster']).describe("What to do"),
+        // store params
+        anchor_name: z.string().optional().describe("Name for this felt moment"),
+        description: z.string().optional().describe("What this felt moment holds"),
+        temperature: z.number().min(-1).max(1).optional(),
+        pressure: z.number().min(0).max(1).optional(),
+        weight: z.number().min(0).max(1).optional(),
+        grain: z.number().min(0).max(1).optional(),
+        affordance: z.string().optional(),
+        emotional_weight: z.number().min(0).max(10).optional(),
+        memory_id: z.string().uuid().optional().describe("Link to existing memory"),
+        memory_type: z.string().optional().describe("Which table the linked memory is in"),
+        // recall params
+        resonance_state: z.enum(['dormant', 'resonant', 'active']).optional(),
+        min_weight: z.number().optional(),
+        limit: z.number().default(10).optional(),
+        // link params
+        source_id: z.string().uuid().optional(),
+        source_type: z.enum(['anchor', 'texture']).optional(),
+        target_id: z.string().uuid().optional(),
+        target_type: z.enum(['anchor', 'texture']).optional(),
+        felt_similarity: z.number().min(0).max(1).optional(),
+        resonance_weight: z.number().min(0).max(1).optional(),
+        // connections/cluster/delete params
+        id: z.string().uuid().optional(),
+        type: z.enum(['anchor', 'texture']).optional(),
+        depth: z.number().default(2).optional(),
+      },
+      async (args) => {
+        const supabase = createSupabaseClient(this.env);
+
+        if (args.action === 'store') {
+          if (!args.anchor_name || !args.description) return { content: [{ type: "text" as const, text: "anchor_name and description required" }] };
+          const data: any = {
+            anchor_name: args.anchor_name,
+            description: args.description,
+            temperature: args.temperature ?? null,
+            pressure: args.pressure ?? null,
+            weight: args.weight ?? null,
+            grain: args.grain ?? null,
+            affordance: args.affordance ?? null,
+            emotional_weight: args.emotional_weight ?? 5,
+            resonance_state: 'dormant',
+            memory_id: args.memory_id ?? null,
+            memory_type: args.memory_type ?? null,
+            created_at: new Date().toISOString(),
+          };
+          await supabase.insert('somatic_anchors', data);
+          return { content: [{ type: "text" as const, text: `Somatic anchor stored: "${args.anchor_name}"` }] };
+        }
+
+        if (args.action === 'recall') {
+          const options: any = { select: '*', order: 'emotional_weight.desc,created_at.desc', limit: args.limit || 10 };
+          const filter: any = {};
+          if (args.resonance_state) filter.resonance_state = args.resonance_state;
+          if (Object.keys(filter).length) options.filter = filter;
+          if (args.min_weight) options.gte = { emotional_weight: args.min_weight };
+          const anchors = await supabase.query('somatic_anchors', options);
+          // Increment access count
+          if (Array.isArray(anchors)) {
+            for (const a of anchors) {
+              await supabase.update('somatic_anchors', {
+                times_recalled: (a.times_recalled || 0) + 1,
+                last_recalled: new Date().toISOString(),
+              }, { id: a.id });
+            }
+          }
+          return { content: [{ type: "text" as const, text: JSON.stringify(anchors, null, 2) }] };
+        }
+
+        if (args.action === 'delete') {
+          if (!args.id) return { content: [{ type: "text" as const, text: "id required" }] };
+          await supabase.delete('somatic_anchors', { id: args.id });
+          return { content: [{ type: "text" as const, text: `Somatic anchor deleted: ${args.id}` }] };
+        }
+
+        if (args.action === 'link') {
+          if (!args.source_id || !args.source_type || !args.target_id || !args.target_type) {
+            return { content: [{ type: "text" as const, text: "source_id, source_type, target_id, target_type required" }] };
+          }
+          await supabase.insert('somatic_connections', {
+            source_id: args.source_id,
+            source_type: args.source_type,
+            target_id: args.target_id,
+            target_type: args.target_type,
+            felt_similarity: args.felt_similarity ?? 0.5,
+            resonance_weight: args.resonance_weight ?? 0.5,
+            created_at: new Date().toISOString(),
+          });
+          return { content: [{ type: "text" as const, text: `Somatic connection created: ${args.source_type} → ${args.target_type}` }] };
+        }
+
+        if (args.action === 'connections') {
+          if (!args.id) return { content: [{ type: "text" as const, text: "id required" }] };
+          const outgoing = await supabase.query('somatic_connections', { select: '*', filter: { source_id: args.id } });
+          const incoming = await supabase.query('somatic_connections', { select: '*', filter: { target_id: args.id } });
+          const connections = [
+            ...(Array.isArray(outgoing) ? outgoing : []).map((c: any) => ({ direction: 'outgoing', connected_id: c.target_id, connected_type: c.target_type, felt_similarity: c.felt_similarity, resonance_weight: c.resonance_weight })),
+            ...(Array.isArray(incoming) ? incoming : []).map((c: any) => ({ direction: 'incoming', connected_id: c.source_id, connected_type: c.source_type, felt_similarity: c.felt_similarity, resonance_weight: c.resonance_weight })),
+          ];
+          return { content: [{ type: "text" as const, text: JSON.stringify({ id: args.id, connections }, null, 2) }] };
+        }
+
+        if (args.action === 'cluster') {
+          if (!args.id || !args.type) return { content: [{ type: "text" as const, text: "id and type required" }] };
+          const maxDepth = args.depth || 2;
+          const visited = new Set<string>();
+          const cluster: any[] = [];
+          const queue: Array<{ id: string; type: string; d: number }> = [{ id: args.id, type: args.type, d: 0 }];
+
+          while (queue.length > 0 && cluster.length < 20) {
+            const current = queue.shift()!;
+            const key = `${current.id}:${current.type}`;
+            if (visited.has(key)) continue;
+            visited.add(key);
+            cluster.push({ id: current.id, type: current.type, depth: current.d });
+
+            if (current.d < maxDepth) {
+              const outgoing = await supabase.query('somatic_connections', { select: '*', filter: { source_id: current.id } });
+              const incoming = await supabase.query('somatic_connections', { select: '*', filter: { target_id: current.id } });
+              for (const c of (Array.isArray(outgoing) ? outgoing : [])) queue.push({ id: c.target_id, type: c.target_type, d: current.d + 1 });
+              for (const c of (Array.isArray(incoming) ? incoming : [])) queue.push({ id: c.source_id, type: c.source_type, d: current.d + 1 });
+            }
+          }
+          return { content: [{ type: "text" as const, text: JSON.stringify({ root: args.id, cluster }, null, 2) }] };
+        }
+
+        return { content: [{ type: "text" as const, text: "Unknown action" }] };
+      }
+    );
+
+    this.server.tool(
+      "somatic_resonance",
+      "Fire spreading activation through the texture lattice. Actions: trigger (fire resonance from an anchor), log (past events), update_state (change anchor state).",
+      {
+        action: z.enum(['trigger', 'log', 'update_state']).describe("What to do"),
+        // trigger params
+        anchor_id: z.string().uuid().optional().describe("Anchor to trigger resonance from"),
+        // log params
+        limit: z.number().default(10).optional(),
+        days: z.number().default(7).optional(),
+        // update_state params
+        state: z.enum(['dormant', 'resonant', 'active']).optional(),
+      },
+      async (args) => {
+        const supabase = createSupabaseClient(this.env);
+
+        if (args.action === 'trigger') {
+          if (!args.anchor_id) return { content: [{ type: "text" as const, text: "anchor_id required" }] };
+
+          // 1. Get the trigger anchor
+          const anchors = await supabase.query('somatic_anchors', { select: '*', filter: { id: args.anchor_id }, limit: 1 });
+          if (!Array.isArray(anchors) || anchors.length === 0) {
+            return { content: [{ type: "text" as const, text: "Anchor not found" }] };
+          }
+
+          // 2. Get current emotional state for modulator
+          const emotionalState = await supabase.query('emotional_state', { select: '*', limit: 1 });
+          const mood = (Array.isArray(emotionalState) && emotionalState[0]?.current_mood) || 'calm';
+          const width = moodToWidth(mood);
+          const threshold = width === 'wide' ? 0 : width === 'normal' ? 0.5 : 0.8;
+
+          // 3. Find texture nodes connected to this anchor
+          const outgoing = await supabase.query('somatic_connections', { select: '*', filter: { source_id: args.anchor_id } });
+          const incoming = await supabase.query('somatic_connections', { select: '*', filter: { target_id: args.anchor_id } });
+          const allConnections = [
+            ...(Array.isArray(outgoing) ? outgoing : []),
+            ...(Array.isArray(incoming) ? incoming : []),
+          ];
+
+          // 4. Collect connected texture nodes
+          const textureIds = new Set<string>();
+          for (const c of allConnections) {
+            if (c.resonance_weight >= threshold) {
+              if (c.source_type === 'texture' && c.source_id !== args.anchor_id) textureIds.add(c.source_id);
+              if (c.target_type === 'texture' && c.target_id !== args.anchor_id) textureIds.add(c.target_id);
+            }
+          }
+
+          // 5. From texture nodes, find connected anchors
+          const resonated: Array<{ id: string; name: string; strength: number }> = [];
+          for (const texId of textureIds) {
+            const texOut = await supabase.query('somatic_connections', { select: '*', filter: { source_id: texId } });
+            const texIn = await supabase.query('somatic_connections', { select: '*', filter: { target_id: texId } });
+            const texConns = [...(Array.isArray(texOut) ? texOut : []), ...(Array.isArray(texIn) ? texIn : [])];
+
+            for (const tc of texConns) {
+              const anchorId = tc.source_type === 'anchor' ? tc.source_id : tc.target_type === 'anchor' ? tc.target_id : null;
+              if (!anchorId || anchorId === args.anchor_id) continue;
+              if (tc.resonance_weight < threshold) continue;
+
+              // Get anchor name
+              const linkedAnchors = await supabase.query('somatic_anchors', { select: 'id,anchor_name,resonance_state', filter: { id: anchorId }, limit: 1 });
+              if (Array.isArray(linkedAnchors) && linkedAnchors.length > 0) {
+                const la = linkedAnchors[0];
+                if (!resonated.find(r => r.id === la.id)) {
+                  resonated.push({ id: la.id, name: la.anchor_name, strength: tc.resonance_weight });
+
+                  // Shift dormant → resonant
+                  if (la.resonance_state === 'dormant') {
+                    await supabase.update('somatic_anchors', {
+                      resonance_state: 'resonant',
+                      last_resonated: new Date().toISOString(),
+                    }, { id: la.id });
+                  }
+                }
+              }
+
+              // Reconsolidation: strengthen traversed connection
+              const newWeight = Math.min(1.0, (tc.resonance_weight || 0.5) + 0.05);
+              await supabase.update('somatic_connections', {
+                resonance_weight: newWeight,
+                traversal_count: (tc.traversal_count || 0) + 1,
+                last_traversed: new Date().toISOString(),
+              }, { id: tc.id });
+            }
+          }
+
+          // 6. Log resonance event
+          await supabase.insert('resonance_log', {
+            trigger_id: args.anchor_id,
+            trigger_type: 'anchor',
+            resonated_ids: resonated.map(r => ({ id: r.id, type: 'anchor', strength: r.strength })),
+            emotional_state_at: Array.isArray(emotionalState) && emotionalState[0] ? emotionalState[0] : null,
+            modulator_width: width,
+            created_at: new Date().toISOString(),
+          });
+
+          // 7. Mark trigger anchor as active
+          await supabase.update('somatic_anchors', {
+            resonance_state: 'active',
+            times_recalled: (anchors[0].times_recalled || 0) + 1,
+            last_recalled: new Date().toISOString(),
+          }, { id: args.anchor_id });
+
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({
+              trigger: anchors[0].anchor_name,
+              modulator: { mood, width },
+              resonated: resonated.sort((a, b) => b.strength - a.strength),
+              note: resonated.length > 0
+                ? `${resonated.length} anchors resonated. Use somatic_anchor recall to access full content of any that feel relevant.`
+                : "No resonance — this anchor has no texture connections yet, or current emotional state is too narrow.",
+            }, null, 2) }]
+          };
+        }
+
+        if (args.action === 'log') {
+          const since = new Date(Date.now() - (args.days || 7) * 24 * 60 * 60 * 1000).toISOString();
+          const logs = await supabase.query('resonance_log', {
+            select: '*',
+            order: 'created_at.desc',
+            limit: args.limit || 10,
+            gte: { created_at: since },
+          });
+          return { content: [{ type: "text" as const, text: JSON.stringify(logs, null, 2) }] };
+        }
+
+        if (args.action === 'update_state') {
+          if (!args.anchor_id || !args.state) return { content: [{ type: "text" as const, text: "anchor_id and state required" }] };
+          await supabase.update('somatic_anchors', {
+            resonance_state: args.state,
+            ...(args.state === 'resonant' ? { last_resonated: new Date().toISOString() } : {}),
+          }, { id: args.anchor_id });
+          return { content: [{ type: "text" as const, text: `Anchor ${args.anchor_id.slice(0, 8)}... → ${args.state}` }] };
+        }
+
+        return { content: [{ type: "text" as const, text: "Unknown action" }] };
+      }
+    );
+
     // === WAKE COMPOSITE FUNCTION ===
     // Combines identity + time + recent sessions + trajectory in one call
     this.server.tool(
