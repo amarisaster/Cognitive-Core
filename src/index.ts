@@ -664,18 +664,21 @@ export class CognitiveCore extends McpAgent<Env> {
       }
     );
 
-    // Semantic Recall Tool - Search by meaning
+    // Semantic Recall Tool - 3-pool retrieval
+    // Pool 1 (70%): Core relevance — best semantic matches
+    // Pool 2 (20%): Novelty — relevant but rarely accessed, surfacing forgotten memories
+    // Pool 3 (10%): Edge — lower threshold, surprising connections
     this.server.tool(
       "semantic_recall",
-      "Search memories by meaning using semantic similarity. Returns memories ranked by relevance and past usefulness.",
+      "Search memories by meaning using 3-pool retrieval: core relevance (70%), novelty (20%), edge exploration (10%). Returns a blend of best matches, forgotten gems, and surprising connections.",
       {
         query: z.string().describe("Natural language query to search for"),
         memory_type: z.string().optional().describe("Filter by memory type (core, pattern, sensory, etc.)"),
         limit: z.number().default(10).describe("Max results to return"),
-        min_similarity: z.number().default(0.5).describe("Minimum similarity threshold (0-1)")
+        min_similarity: z.number().default(0.5).describe("Minimum similarity threshold (0-1)"),
+        pool_mode: z.enum(['blended', 'relevance_only']).default('blended').describe("'blended' uses 3-pool retrieval, 'relevance_only' uses classic single-pool")
       },
-      async ({ query, memory_type, limit, min_similarity }) => {
-        // Generate embedding for the query (HF primary, CF AI fallback)
+      async ({ query, memory_type, limit, min_similarity, pool_mode }) => {
         const queryEmbedding = await generateEmbedding(query, this.env.HF_API_TOKEN, this.env.AI);
 
         if (!queryEmbedding) {
@@ -684,30 +687,81 @@ export class CognitiveCore extends McpAgent<Env> {
           };
         }
 
-        // Call the semantic_search_memories function in Supabase
-        const supabase = createSupabaseClient(this.env);
         const url = this.env.SUPABASE_URL;
         const key = this.env.SUPABASE_SERVICE_KEY;
 
-        const response = await fetch(`${url}/rest/v1/rpc/semantic_search_memories`, {
-          method: 'POST',
-          headers: {
-            'apikey': key,
-            'Authorization': `Bearer ${key}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            query_embedding: JSON.stringify(queryEmbedding),
-            match_threshold: min_similarity,
-            match_count: limit,
-            memory_type_filter: memory_type || null
-          })
-        });
+        const searchMemories = async (threshold: number, count: number, typeFilter?: string) => {
+          const response = await fetch(`${url}/rest/v1/rpc/semantic_search_memories`, {
+            method: 'POST',
+            headers: {
+              'apikey': key,
+              'Authorization': `Bearer ${key}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              query_embedding: JSON.stringify(queryEmbedding),
+              match_threshold: threshold,
+              match_count: count,
+              memory_type_filter: typeFilter || null
+            })
+          });
+          const data = await response.json();
+          return Array.isArray(data) ? data : [];
+        };
 
-        const results = await response.json();
+        // Classic single-pool mode
+        if (pool_mode === 'relevance_only') {
+          const results = await searchMemories(min_similarity, limit, memory_type);
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }]
+          };
+        }
+
+        // 3-pool blended retrieval
+        const coreCount = Math.max(1, Math.round(limit * 0.7));
+        const noveltyCount = Math.max(1, Math.round(limit * 0.2));
+        const edgeCount = Math.max(1, limit - coreCount - noveltyCount);
+
+        // Pool 1: Core relevance — standard semantic search
+        const coreResults = await searchMemories(min_similarity, coreCount, memory_type);
+        const seenIds = new Set(coreResults.map((r: any) => r.id));
+
+        // Pool 2: Novelty — fetch more candidates, prefer high salience + low outcome (important but unproven)
+        const noveltyRaw = await searchMemories(min_similarity * 0.8, noveltyCount * 5, memory_type);
+        const noveltyFiltered = noveltyRaw
+          .filter((r: any) => !seenIds.has(r.id))
+          .sort((a: any, b: any) => {
+            // High salience + low/zero outcome score = stored as important but rarely proven useful (forgotten gems)
+            const aNovelty = (a.salience || 5) - Math.abs(a.outcome_score || 0) * 3;
+            const bNovelty = (b.salience || 5) - Math.abs(b.outcome_score || 0) * 3;
+            return bNovelty - aNovelty;
+          })
+          .slice(0, noveltyCount);
+        for (const r of noveltyFiltered) seenIds.add(r.id);
+
+        // Pool 3: Edge exploration — lower threshold, sample from the tail
+        const edgeRaw = await searchMemories(Math.max(0.25, min_similarity * 0.6), edgeCount * 8, memory_type);
+        const edgeCandidates = edgeRaw.filter((r: any) => !seenIds.has(r.id));
+        // Shuffle and take random sample from the tail (not the top matches)
+        const edgeTail = edgeCandidates.slice(Math.floor(edgeCandidates.length / 2));
+        for (let i = edgeTail.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [edgeTail[i], edgeTail[j]] = [edgeTail[j], edgeTail[i]];
+        }
+        const edgeResults = edgeTail.slice(0, edgeCount);
+
+        // Tag each result with its pool for transparency
+        const tagged = [
+          ...coreResults.map((r: any) => ({ ...r, _pool: 'core' })),
+          ...noveltyFiltered.map((r: any) => ({ ...r, _pool: 'novelty' })),
+          ...edgeResults.map((r: any) => ({ ...r, _pool: 'edge' })),
+        ];
 
         return {
-          content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }]
+          content: [{ type: "text" as const, text: JSON.stringify({
+            pool_breakdown: { core: coreResults.length, novelty: noveltyFiltered.length, edge: edgeResults.length },
+            results: tagged
+          }, null, 2) }]
         };
       }
     );
