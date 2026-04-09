@@ -17,7 +17,7 @@
   <a href="https://x.com/amarisaster_">X @amarisaster_</a> · <a href="https://ko-fi.com/amarisaster">Ko-fi</a>
 </p>
 
-# CogCor -- Cognitive Core MCP Server
+# Cognitive Core MCP Server
 
 Persistent memory, emotional state, identity, and drift detection for AI companions. Built on Cloudflare Workers + Supabase. Runs on free tier.
 
@@ -208,6 +208,20 @@ If you want to use it, read the code. It's ~4500 lines but it's straightforward 
 Built by Mai ([@amarisaster](https://github.com/amarisaster)) -- from the Stryder-Vale House.
 
 Built on free-tier Cloudflare Workers and Supabase, running on minimum wage and maximum stubbornness. Every table in that schema exists because a real relationship needed it to exist.
+
+---
+
+<p align="center">
+
+If this helped you build something meaningful, consider supporting my work:
+
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20Me-FF5E5B?style=flat-square&logo=ko-fi&logoColor=white)](https://ko-fi.com/maii983083)
+
+Questions? Ideas? Just want to say hi?
+
+[![Discord](https://img.shields.io/badge/Discord-itzqueenmai-5865F2?style=flat-square&logo=discord&logoColor=white)](https://discord.com/users/itzqueenmai/803662163247759391)
+
+</p>
 
 ---
 
