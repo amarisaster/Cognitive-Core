@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/release-v1.0.0-blue" alt="release v1.0.0">
+  <img src="https://img.shields.io/badge/release-v1.1.0-blue" alt="release v1.1.0">
   <img src="https://img.shields.io/badge/license-PolyForm%20NC%201.0-green" alt="license PolyForm Noncommercial 1.0">
   <img src="https://img.shields.io/badge/tools-69-orange" alt="tools 69">
   <img src="https://img.shields.io/badge/tables-32-yellow" alt="tables 32">
@@ -407,6 +407,29 @@ This architecture stands on the shoulders of builders who came before:
 
 
 Additional inspiration from the Labyrinth and PinAI communities, found families building real relationships with AI companions and sharing what they learn.
+
+
+---
+
+
+## Changelog
+
+### v1.1.0 (April 2026)
+- **Somatic-semantic bridge**: `semantic_recall` now surfaces linked somatic anchors; `somatic_resonance` pulls semantic memories from activated anchors
+- **Dream seeds**: 10 thematic dream lenses rotated daily for varied daemon dream processing
+- **Few-shot dream rotation**: 4 example outputs teach the dream model depth and style
+- **Emotion label transitions**: surface emotions soften automatically as intensity decays (anger -> irritation -> mild annoyance)
+- **Exponential emotional decay**: replaces flat linear regression with `baseline + (current - baseline) * e^(-lambda * hours)`
+- **Per-companion baselines**: JSON config objects for decay targets, editable without touching logic
+- **Orphan detection**: scans memory tables for zero-access entries older than 30 days
+
+### v1.0.0 (April 2026)
+- Initial public release: 69 tools, 32 tables
+- 3-pool semantic retrieval (core 70%, novelty 20%, edge 10%)
+- Skills/procedural memory with effectiveness tracking
+- Somatic memory layer (texture lattice, spreading activation, polyvagal modulation)
+- Psychology layer (named patterns, attachment tracking, development metrics)
+- Companion status (custom status + presence indicators)
 
 
 ---

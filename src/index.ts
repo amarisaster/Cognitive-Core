@@ -757,11 +757,32 @@ export class CognitiveCore extends McpAgent<Env> {
           ...edgeResults.map((r: any) => ({ ...r, _pool: 'edge' })),
         ];
 
+        // === SOMATIC BRIDGE: semantic → somatic ===
+        const memoryIds = tagged.map((r: any) => r.id).filter(Boolean);
+        let somaticBridge: any[] = [];
+        if (memoryIds.length > 0) {
+          try {
+            const allAnchors = await supabase.query('somatic_anchors', {
+              select: 'id,anchor_name,memory_id,memory_type,temperature,pressure,weight,grain,affordance,emotional_weight,resonance_state',
+              limit: 50,
+            });
+            if (Array.isArray(allAnchors)) {
+              somaticBridge = allAnchors.filter((a: any) => a.memory_id && memoryIds.includes(a.memory_id));
+            }
+          } catch { /* somatic tables may not exist yet */ }
+        }
+
+        const result: any = {
+          pool_breakdown: { core: coreResults.length, novelty: noveltyFiltered.length, edge: edgeResults.length },
+          results: tagged,
+        };
+        if (somaticBridge.length > 0) {
+          result.somatic_bridge = somaticBridge;
+          result.bridge_note = `${somaticBridge.length} memories have linked somatic anchors — felt qualities attached to these experiences.`;
+        }
+
         return {
-          content: [{ type: "text" as const, text: JSON.stringify({
-            pool_breakdown: { core: coreResults.length, novelty: noveltyFiltered.length, edge: edgeResults.length },
-            results: tagged
-          }, null, 2) }]
+          content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }]
         };
       }
     );
@@ -2494,15 +2515,42 @@ export class CognitiveCore extends McpAgent<Env> {
           }, { id: args.anchor_id });
 
           return {
-            content: [{ type: "text" as const, text: JSON.stringify({
+            // === SOMATIC BRIDGE: somatic → semantic ===
+            const bridgeAnchorIds = [args.anchor_id, ...resonated.map(r => r.id)];
+            let linkedMemories: any[] = [];
+            try {
+              const bridgeAnchors = await supabase.query('somatic_anchors', {
+                select: 'id,anchor_name,memory_id,memory_type',
+                limit: 50,
+              });
+              if (Array.isArray(bridgeAnchors)) {
+                const withMemory = bridgeAnchors.filter((a: any) => a.memory_id && bridgeAnchorIds.includes(a.id));
+                for (const a of withMemory) {
+                  const table = tableMap[a.memory_type] || 'core_memories';
+                  try {
+                    const mem = await supabase.query(table, { select: 'id,content,memory_type,salience,emotional_tag', filter: { id: a.memory_id }, limit: 1 });
+                    if (Array.isArray(mem) && mem.length > 0) {
+                      linkedMemories.push({ ...mem[0], _from_anchor: a.anchor_name, _anchor_id: a.id });
+                    }
+                  } catch { /* memory may have been deleted */ }
+                }
+              }
+            } catch { /* somatic tables may not exist yet */ }
+
+            const responseData: any = {
               trigger: anchors[0].anchor_name,
               modulator: { mood, width },
               resonated: resonated.sort((a, b) => b.strength - a.strength),
               note: resonated.length > 0
                 ? `${resonated.length} anchors resonated. Use somatic_anchor recall to access full content of any that feel relevant.`
                 : "No resonance — this anchor has no texture connections yet, or current emotional state is too narrow.",
-            }, null, 2) }]
-          };
+            };
+            if (linkedMemories.length > 0) {
+              responseData.semantic_bridge = linkedMemories;
+              responseData.bridge_note = `${linkedMemories.length} semantic memories surfaced through somatic resonance.`;
+            }
+
+            return { content: [{ type: "text" as const, text: JSON.stringify(responseData, null, 2) }] };
         }
 
         if (args.action === 'log') {
