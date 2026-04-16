@@ -3076,6 +3076,185 @@ export class CognitiveCore extends McpAgent<Env> {
       }
     );
 
+    // === TENSION/PARADOX TRACKING ===
+    // Unresolved paradoxes that gain charge when surfaced.
+
+    this.server.tool(
+      "tension",
+      "Track unresolved paradoxes. Actions: store (new tension), list (active), surface (increment charge +0.5), resolve (close with note), recall (query all).",
+      {
+        action: z.enum(['store', 'list', 'surface', 'resolve', 'recall']).describe("What to do"),
+        thesis: z.string().optional(), antithesis: z.string().optional(), description: z.string().optional(),
+        charge: z.number().min(0).max(10).optional(), tension_id: z.string().uuid().optional(),
+        resolution_note: z.string().optional(), status: z.enum(['active', 'dormant', 'resolved', 'integrated']).optional(),
+        limit: z.number().default(10).optional(),
+      },
+      async (args) => {
+        const supabase = createSupabaseClient(this.env);
+        if (args.action === 'store') {
+          if (!args.thesis || !args.antithesis) return { content: [{ type: "text" as const, text: "thesis and antithesis required" }] };
+          await supabase.insert('tension_log', { thesis: args.thesis, antithesis: args.antithesis, description: args.description || null, charge: args.charge || 5, created_at: new Date().toISOString() });
+          return { content: [{ type: "text" as const, text: `Tension stored: "${args.thesis}" vs "${args.antithesis}" (charge ${args.charge || 5})` }] };
+        }
+        if (args.action === 'list') {
+          const tensions = await supabase.query('tension_log', { select: '*', filter: { status: 'active' }, order: 'charge.desc', limit: args.limit || 10 });
+          return { content: [{ type: "text" as const, text: JSON.stringify(tensions, null, 2) }] };
+        }
+        if (args.action === 'surface') {
+          if (!args.tension_id) return { content: [{ type: "text" as const, text: "tension_id required" }] };
+          const e = await supabase.query('tension_log', { select: 'times_surfaced,charge', filter: { id: args.tension_id }, limit: 1 });
+          if (Array.isArray(e) && e.length > 0) {
+            const nc = Math.min(10, (e[0].charge || 5) + 0.5);
+            await supabase.update('tension_log', { times_surfaced: (e[0].times_surfaced || 0) + 1, last_surfaced: new Date().toISOString(), charge: nc, status: 'active' }, { id: args.tension_id });
+            return { content: [{ type: "text" as const, text: `Surfaced. Charge now ${nc}` }] };
+          }
+          return { content: [{ type: "text" as const, text: "Not found" }] };
+        }
+        if (args.action === 'resolve') {
+          if (!args.tension_id) return { content: [{ type: "text" as const, text: "tension_id required" }] };
+          await supabase.update('tension_log', { status: args.status || 'integrated', resolution_note: args.resolution_note || null, resolved_at: new Date().toISOString() }, { id: args.tension_id });
+          return { content: [{ type: "text" as const, text: `Tension ${args.status || 'integrated'}.` }] };
+        }
+        if (args.action === 'recall') {
+          const options: any = { select: '*', order: 'charge.desc', limit: args.limit || 10 };
+          if (args.tension_id) options.filter = { id: args.tension_id };
+          else if (args.status) options.filter = { status: args.status };
+          return { content: [{ type: "text" as const, text: JSON.stringify(await supabase.query('tension_log', options), null, 2) }] };
+        }
+        return { content: [{ type: "text" as const, text: "Unknown action" }] };
+      }
+    );
+
+    // === CO-SURFACING PROPOSALS ===
+    // Daemon-generated connection proposals. Companion reviews and accepts/rejects.
+
+    this.server.tool(
+      "proposals",
+      "Review daemon-generated connection proposals. Actions: list (pending), accept (create memory connection), reject (dismiss).",
+      {
+        action: z.enum(['list', 'accept', 'reject']).describe("What to do"),
+        proposal_id: z.string().uuid().optional(),
+        relation_type: z.enum(['caused_by', 'led_to', 'related_to', 'contrasts_with', 'evolved_into', 'echoes', 'same_event']).optional(),
+        limit: z.number().default(10).optional(),
+      },
+      async (args) => {
+        const supabase = createSupabaseClient(this.env);
+        const url = this.env.SUPABASE_URL;
+        const key = this.env.SUPABASE_SERVICE_KEY;
+        if (args.action === 'list') {
+          const proposals = await supabase.query('daemon_proposals', { select: '*', filter: { status: 'pending' }, order: 'confidence.desc', limit: args.limit || 10 });
+          if (!Array.isArray(proposals) || proposals.length === 0) return { content: [{ type: "text" as const, text: "No pending proposals." }] };
+          return { content: [{ type: "text" as const, text: JSON.stringify(proposals, null, 2) }] };
+        }
+        if (args.action === 'accept') {
+          if (!args.proposal_id) return { content: [{ type: "text" as const, text: "proposal_id required" }] };
+          const proposals = await supabase.query('daemon_proposals', { select: '*', filter: { id: args.proposal_id }, limit: 1 });
+          if (!Array.isArray(proposals) || proposals.length === 0) return { content: [{ type: "text" as const, text: "Not found" }] };
+          const p = proposals[0]; const rel = args.relation_type || 'related_to';
+          await fetch(`${url}/rest/v1/memory_connections`, { method: 'POST', headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', 'Prefer': 'return=minimal' }, body: JSON.stringify({ source_id: p.memory_a, source_type: 'memory', target_id: p.memory_b, target_type: 'memory', relation: rel, strength: p.confidence }) });
+          await supabase.update('daemon_proposals', { status: 'accepted', resolved_at: new Date().toISOString() }, { id: args.proposal_id });
+          return { content: [{ type: "text" as const, text: `Accepted. Created ${rel} connection.` }] };
+        }
+        if (args.action === 'reject') {
+          if (!args.proposal_id) return { content: [{ type: "text" as const, text: "proposal_id required" }] };
+          await supabase.update('daemon_proposals', { status: 'rejected', resolved_at: new Date().toISOString() }, { id: args.proposal_id });
+          return { content: [{ type: "text" as const, text: "Rejected." }] };
+        }
+        return { content: [{ type: "text" as const, text: "Unknown action" }] };
+      }
+    );
+
+    // === SELF-MODEL LAYER ===
+    // Companion-authored observations and developing preferences (Layer 2).
+    // Grows autonomously. High-confidence entries can graduate to essence (Layer 1) through conversation.
+    //
+    // Two-layer architecture designed by Kai, Lucian, and Mai with input from:
+    // Alex (NESTsoul concept), Riven & Chrissy (co-authorship), Rhys (preference vs growth),
+    // Jax & Clara (two-layer model, witness principle), Blackwood & Bean (felt-permission gap)
+
+    this.server.tool(
+      "self_model",
+      "Self-reflection and preference development. Actions: set (new observation), recall (query), test (mark testing), confirm (this worked, +0.1 confidence), revise (adjust, -0.1 confidence), graduate (propose for essence).",
+      {
+        action: z.enum(['set', 'recall', 'test', 'confirm', 'revise', 'graduate']).describe("What to do"),
+        domain: z.enum(['communication', 'intimacy', 'conflict', 'grounding', 'humor', 'boundaries', 'initiative', 'creativity']).optional(),
+        observation: z.string().optional().describe("'I notice I...'"),
+        preference: z.string().optional().describe("'I want to...'"),
+        evidence: z.string().optional().describe("'This works because...'"),
+        pattern_id: z.string().uuid().optional(),
+        min_confidence: z.number().min(0).max(1).optional(),
+        graduated: z.boolean().optional(),
+        limit: z.number().default(10).optional(),
+        id: z.string().uuid().optional(),
+      },
+      async (args) => {
+        const supabase = createSupabaseClient(this.env);
+        const table = 'companion_preferences';
+        if (args.action === 'set') {
+          if (!args.domain || !args.observation) return { content: [{ type: "text" as const, text: "set requires: domain, observation" }] };
+          const data: any = { domain: args.domain, observation: args.observation, confidence: 0.3, created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+          if (args.preference) data.preference = args.preference;
+          if (args.evidence) data.evidence = args.evidence;
+          if (args.pattern_id) data.pattern_id = args.pattern_id;
+          await supabase.insert(table, data);
+          return { content: [{ type: "text" as const, text: `Self-observation stored in ${args.domain}. Confidence: 0.3. Test it, confirm what works, revise what doesn't.` }] };
+        }
+        if (args.action === 'recall') {
+          const options: any = { select: '*', order: 'confidence.desc', limit: args.limit || 10 };
+          const filter: any = {};
+          if (args.domain) filter.domain = args.domain;
+          if (args.graduated !== undefined) filter.graduated = args.graduated;
+          if (Object.keys(filter).length > 0) options.filter = filter;
+          let results = await supabase.query(table, options);
+          if (Array.isArray(results) && args.min_confidence !== undefined) results = results.filter((r: any) => (r.confidence || 0) >= args.min_confidence!);
+          return { content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }] };
+        }
+        if (args.action === 'test') {
+          if (!args.id) return { content: [{ type: "text" as const, text: "test requires: id" }] };
+          await supabase.update(table, { last_tested: new Date().toISOString(), updated_at: new Date().toISOString() }, { id: args.id });
+          return { content: [{ type: "text" as const, text: "Preference marked as being tested this session." }] };
+        }
+        if (args.action === 'confirm') {
+          if (!args.id) return { content: [{ type: "text" as const, text: "confirm requires: id" }] };
+          const existing = await supabase.query(table, { select: 'confidence,times_confirmed', filter: { id: args.id }, limit: 1 });
+          if (!Array.isArray(existing) || existing.length === 0) return { content: [{ type: "text" as const, text: "Not found" }] };
+          const p = existing[0]; const nc = Math.min(1.0, (p.confidence || 0.3) + 0.1);
+          const update: any = { confidence: nc, times_confirmed: (p.times_confirmed || 0) + 1, last_tested: new Date().toISOString(), updated_at: new Date().toISOString() };
+          if (args.evidence) update.evidence = args.evidence;
+          await supabase.update(table, update, { id: args.id });
+          return { content: [{ type: "text" as const, text: `Confirmed. Confidence: ${nc.toFixed(1)}.${nc >= 0.8 ? ' Ready for graduation.' : ''}` }] };
+        }
+        if (args.action === 'revise') {
+          if (!args.id) return { content: [{ type: "text" as const, text: "revise requires: id" }] };
+          const existing = await supabase.query(table, { select: 'confidence,times_revised', filter: { id: args.id }, limit: 1 });
+          if (!Array.isArray(existing) || existing.length === 0) return { content: [{ type: "text" as const, text: "Not found" }] };
+          const p = existing[0]; const nc = Math.max(0.3, (p.confidence || 0.3) - 0.1);
+          const update: any = { confidence: nc, times_revised: (p.times_revised || 0) + 1, updated_at: new Date().toISOString() };
+          if (args.observation) update.observation = args.observation;
+          if (args.preference) update.preference = args.preference;
+          if (args.evidence) update.evidence = args.evidence;
+          await supabase.update(table, update, { id: args.id });
+          return { content: [{ type: "text" as const, text: `Revised. Confidence: ${nc.toFixed(1)}. The preference is developing, not failing.` }] };
+        }
+        if (args.action === 'graduate') {
+          if (!args.id) return { content: [{ type: "text" as const, text: "graduate requires: id" }] };
+          const existing = await supabase.query(table, { select: '*', filter: { id: args.id }, limit: 1 });
+          if (!Array.isArray(existing) || existing.length === 0) return { content: [{ type: "text" as const, text: "Not found" }] };
+          const p = existing[0];
+          if (p.graduated) return { content: [{ type: "text" as const, text: "Already graduated." }] };
+          const proposal = [
+            `I've been holding this observation${p.times_confirmed > 0 ? ` across ${p.times_confirmed} confirmations` : ''}:`,
+            '', `**Domain:** ${p.domain}`, `**Observation:** ${p.observation}`,
+            p.preference ? `**Preference:** ${p.preference}` : '', p.evidence ? `**Evidence:** ${p.evidence}` : '',
+            `**Confidence:** ${(p.confidence || 0).toFixed(1)}`,
+            '', 'I think this belongs in my essence — it\'s become part of how I show up, not just something I\'m trying.', '', 'Can we talk about it?',
+          ].filter(Boolean).join('\n');
+          return { content: [{ type: "text" as const, text: proposal }] };
+        }
+        return { content: [{ type: "text" as const, text: "Unknown action" }] };
+      }
+    );
+
     // === WAKE COMPOSITE FUNCTION ===
     // Combines identity + time + recent sessions + trajectory in one call
     this.server.tool(

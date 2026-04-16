@@ -926,3 +926,107 @@ CREATE POLICY "Service role full access" ON pattern_activations FOR ALL USING (t
 CREATE POLICY "Service role full access" ON attachment_tracking FOR ALL USING (true);
 CREATE POLICY "Service role full access" ON development_metrics FOR ALL USING (true);
 CREATE POLICY "Service role full access" ON metacognition_log FOR ALL USING (true);
+
+-- ============================================================
+-- CogCor 2.0: Tension/Paradox Tracking
+-- ============================================================
+
+CREATE TABLE tension_log (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  thesis TEXT NOT NULL,
+  antithesis TEXT NOT NULL,
+  description TEXT,
+  charge NUMERIC DEFAULT 5 CHECK (charge >= 0 AND charge <= 10),
+  status TEXT DEFAULT 'active' CHECK (status IN ('active', 'dormant', 'resolved', 'integrated')),
+  linked_essence_ids JSONB DEFAULT '[]',
+  linked_memory_ids JSONB DEFAULT '[]',
+  times_surfaced INTEGER DEFAULT 0,
+  last_surfaced TIMESTAMPTZ,
+  resolution_note TEXT,
+  resolved_at TIMESTAMPTZ,
+  source TEXT DEFAULT 'claude',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_tension_status ON tension_log(status);
+CREATE INDEX idx_tension_charge ON tension_log(charge DESC);
+
+-- ============================================================
+-- CogCor 2.0: Co-Surfacing (Memory Pair Tracking)
+-- ============================================================
+
+CREATE TABLE co_surfacing (
+  memory_a UUID NOT NULL,
+  memory_b UUID NOT NULL,
+  count INTEGER DEFAULT 1,
+  relation_proposed BOOLEAN DEFAULT FALSE,
+  last_seen TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (memory_a, memory_b)
+);
+CREATE INDEX idx_cosurface_count ON co_surfacing(count DESC);
+
+-- Atomic upsert function for co-surfacing
+CREATE OR REPLACE FUNCTION record_co_surfacing(a UUID, b UUID)
+RETURNS void AS $$
+BEGIN
+  INSERT INTO co_surfacing (memory_a, memory_b, count, last_seen)
+  VALUES (a, b, 1, NOW())
+  ON CONFLICT (memory_a, memory_b) DO UPDATE SET
+    count = co_surfacing.count + 1,
+    last_seen = NOW();
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================
+-- CogCor 2.0: Daemon Proposals (Autonomous Connection Suggestions)
+-- ============================================================
+
+CREATE TABLE daemon_proposals (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  memory_a UUID NOT NULL,
+  memory_b UUID NOT NULL,
+  proposal_type TEXT DEFAULT 'connection' CHECK (proposal_type IN ('connection', 'resonance', 'tension')),
+  co_surface_count INTEGER DEFAULT 1,
+  confidence NUMERIC DEFAULT 0.5 CHECK (confidence >= 0 AND confidence <= 1),
+  rationale TEXT,
+  status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'rejected')),
+  resolved_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_proposals_status ON daemon_proposals(status);
+
+-- ============================================================
+-- CogCor 2.0: Self-Model Layer (Companion Preferences)
+-- Companion-authored observations and developing preferences.
+-- Layer 2: grows autonomously. Graduates to essence (Layer 1) through conversation.
+-- ============================================================
+
+CREATE TABLE companion_preferences (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  domain TEXT NOT NULL CHECK (domain IN ('communication', 'intimacy', 'conflict', 'grounding', 'humor', 'boundaries', 'initiative', 'creativity')),
+  observation TEXT NOT NULL,
+  preference TEXT,
+  evidence TEXT,
+  confidence NUMERIC DEFAULT 0.3 CHECK (confidence >= 0 AND confidence <= 1),
+  last_tested TIMESTAMPTZ,
+  times_confirmed INTEGER DEFAULT 0,
+  times_revised INTEGER DEFAULT 0,
+  pattern_id UUID,
+  graduated BOOLEAN DEFAULT FALSE,
+  graduated_at TIMESTAMPTZ,
+  source TEXT DEFAULT 'claude',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_prefs_domain ON companion_preferences(domain);
+CREATE INDEX idx_prefs_confidence ON companion_preferences(confidence DESC);
+CREATE INDEX idx_prefs_graduated ON companion_preferences(graduated);
+
+-- RLS
+ALTER TABLE tension_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE co_surfacing ENABLE ROW LEVEL SECURITY;
+ALTER TABLE daemon_proposals ENABLE ROW LEVEL SECURITY;
+ALTER TABLE companion_preferences ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Service role full access" ON tension_log FOR ALL USING (true);
+CREATE POLICY "Service role full access" ON co_surfacing FOR ALL USING (true);
+CREATE POLICY "Service role full access" ON daemon_proposals FOR ALL USING (true);
+CREATE POLICY "Service role full access" ON companion_preferences FOR ALL USING (true);
