@@ -265,6 +265,54 @@ const intToRelation: Record<number, string> = {
   5: 'evolved_into', 6: 'echoes', 7: 'same_event'
 };
 
+// === GRAPH-INFUSED RETRIEVAL CONFIG ===
+
+const INTENT_CONFIG: Record<string, { alpha: number, beta: number, gamma: number, delta: number, epsilon: number, maxDepth: number, nodeBudget: number, halfLifeDays: number }> = {
+  casual:     { alpha: 0.6, beta: 0.0, gamma: 0.2, delta: 0.1, epsilon: 0.1, maxDepth: 0, nodeBudget: 50, halfLifeDays: 365 },
+  factual:    { alpha: 0.55, beta: 0.1, gamma: 0.1, delta: 0.2, epsilon: 0.05, maxDepth: 1, nodeBudget: 50, halfLifeDays: 365 },
+  emotional:  { alpha: 0.25, beta: 0.2, gamma: 0.15, delta: 0.25, epsilon: 0.15, maxDepth: 1, nodeBudget: 50, halfLifeDays: 365 },
+  relational: { alpha: 0.25, beta: 0.45, gamma: 0.1, delta: 0.1, epsilon: 0.1, maxDepth: 2, nodeBudget: 50, halfLifeDays: 365 },
+  research:   { alpha: 0.4, beta: 0.3, gamma: 0.1, delta: 0.2, epsilon: 0.0, maxDepth: 2, nodeBudget: 100, halfLifeDays: 365 },
+};
+
+function computeEdgeDecay(createdAt: string | null, halfLifeDays: number, persistent?: boolean): number {
+  if (persistent) return 1.0;
+  if (!createdAt) return 1.0;
+  const ageDays = (Date.now() - new Date(createdAt).getTime()) / 86400000;
+  return Math.exp(-ageDays / halfLifeDays);
+}
+
+function computeRecencyDecay(createdAt: string | null): number {
+  if (!createdAt) return 0.5;
+  const ageDays = (Date.now() - new Date(createdAt).getTime()) / 86400000;
+  return 1 / (1 + ageDays / 30);
+}
+
+function computeSomaticValence(anchor: any, intent: string): number {
+  if (!anchor) return 0;
+  const emotionalWeight = (anchor.emotional_weight || 0) / 10;
+  const temperature = anchor.temperature || 0;
+  const rawValence = emotionalWeight * temperature;
+  if (intent === 'casual') return rawValence;
+  if (intent === 'emotional') return Math.abs(rawValence);
+  if (intent === 'research') return 0;
+  return rawValence * 0.5;
+}
+
+function computeCompositeScore(
+  vectorSim: number, graphProximity: number, createdAt: string | null,
+  outcomeScore: number, somaticValence: number, intent: string
+): number {
+  const config = INTENT_CONFIG[intent] || INTENT_CONFIG.factual;
+  const recency = computeRecencyDecay(createdAt);
+  const outcome = (outcomeScore || 0) / 10;
+  return config.alpha * vectorSim
+       + config.beta * graphProximity
+       + config.gamma * recency
+       + config.delta * outcome
+       + config.epsilon * somaticValence;
+}
+
 // Map input types to valid database memory_type values
 const dbTypeMap: Record<string, string> = {
   'core': 'bond_moment',
@@ -686,20 +734,22 @@ export class CognitiveCore extends McpAgent<Env> {
     );
 
     // Semantic Recall Tool - 3-pool retrieval
+    // Semantic Recall — 3-pool retrieval with intent-based graph expansion
     // Pool 1 (70%): Core relevance — best semantic matches
     // Pool 2 (20%): Novelty — relevant but rarely accessed, surfacing forgotten memories
     // Pool 3 (10%): Edge — lower threshold, surprising connections
     this.server.tool(
       "semantic_recall",
-      "Search memories by meaning using 3-pool retrieval: core relevance (70%), novelty (20%), edge exploration (10%). Returns a blend of best matches, forgotten gems, and surprising connections.",
+      "Search memories by meaning using graph-infused retrieval. Intent controls traversal depth, scoring weights, and graceful omission. Pass intent to shape what wins retrieval.",
       {
         query: z.string().describe("Natural language query to search for"),
         memory_type: z.string().optional().describe("Filter by memory type (core, pattern, sensory, etc.)"),
         limit: z.number().default(10).describe("Max results to return"),
         min_similarity: z.number().default(0.5).describe("Minimum similarity threshold (0-1)"),
-        pool_mode: z.enum(['blended', 'relevance_only']).default('blended').describe("'blended' uses 3-pool retrieval, 'relevance_only' uses classic single-pool")
+        pool_mode: z.enum(['blended', 'relevance_only']).default('blended').describe("'blended' uses 3-pool retrieval, 'relevance_only' uses classic single-pool"),
+        intent: z.enum(['casual', 'emotional', 'factual', 'relational', 'research']).default('factual').optional().describe("Query intent — controls graph traversal and scoring. casual=safe/no traversal, emotional=depth+importance, factual=standard, relational=graph-heavy, research=wide exploration")
       },
-      async ({ query, memory_type, limit, min_similarity, pool_mode }) => {
+      async ({ query, memory_type, limit, min_similarity, pool_mode, intent }) => {
         const queryEmbedding = await generateEmbedding(query, this.env.HF_API_TOKEN, this.env.AI);
 
         if (!queryEmbedding) {
@@ -752,7 +802,6 @@ export class CognitiveCore extends McpAgent<Env> {
         const noveltyFiltered = noveltyRaw
           .filter((r: any) => !seenIds.has(r.id))
           .sort((a: any, b: any) => {
-            // High salience + low/zero outcome score = stored as important but rarely proven useful (forgotten gems)
             const aNovelty = (a.salience || 5) - Math.abs(a.outcome_score || 0) * 3;
             const bNovelty = (b.salience || 5) - Math.abs(b.outcome_score || 0) * 3;
             return bNovelty - aNovelty;
@@ -763,7 +812,6 @@ export class CognitiveCore extends McpAgent<Env> {
         // Pool 3: Edge exploration — lower threshold, sample from the tail
         const edgeRaw = await searchMemories(Math.max(0.25, min_similarity * 0.6), edgeCount * 8, memory_type);
         const edgeCandidates = edgeRaw.filter((r: any) => !seenIds.has(r.id));
-        // Shuffle and take random sample from the tail (not the top matches)
         const edgeTail = edgeCandidates.slice(Math.floor(edgeCandidates.length / 2));
         for (let i = edgeTail.length - 1; i > 0; i--) {
           const j = Math.floor(Math.random() * (i + 1));
@@ -778,9 +826,106 @@ export class CognitiveCore extends McpAgent<Env> {
           ...edgeResults.map((r: any) => ({ ...r, _pool: 'edge' })),
         ];
 
-        // === SOMATIC BRIDGE: semantic → somatic ===
-        const memoryIds = tagged.map((r: any) => r.id).filter(Boolean);
+        // === GRAPH EXPANSION ===
+        const intentMode = intent || 'factual';
+        const intentConfig = INTENT_CONFIG[intentMode] || INTENT_CONFIG.factual;
+        let graphExpanded: any[] = [];
+
+        if (intentConfig.maxDepth > 0 && tagged.length > 0) {
+          try {
+            const visited = new Set(tagged.map((r: any) => r.id));
+            let nodesVisited = 0;
+            const seedResults = tagged.slice(0, 5);
+
+            for (const seed of seedResults) {
+              if (nodesVisited >= intentConfig.nodeBudget) break;
+
+              const outgoing = await supabase.query('memory_connections', { select: '*', filter: { source_id: seed.id } });
+              const incoming = await supabase.query('memory_connections', { select: '*', filter: { target_id: seed.id } });
+
+              const hop1Connections = [
+                ...(Array.isArray(outgoing) ? outgoing : []).map((c: any) => ({ id: c.target_id, type: c.target_type, strength: c.strength, created_at: c.created_at, persistent: c.persistent })),
+                ...(Array.isArray(incoming) ? incoming : []).map((c: any) => ({ id: c.source_id, type: c.source_type, strength: c.strength, created_at: c.created_at, persistent: c.persistent })),
+              ];
+
+              for (const conn of hop1Connections) {
+                if (visited.has(conn.id) || nodesVisited >= intentConfig.nodeBudget) continue;
+                visited.add(conn.id);
+                nodesVisited++;
+
+                const edgeDecay = computeEdgeDecay(conn.created_at, intentConfig.halfLifeDays, conn.persistent);
+                const parentScore = seed.similarity || seed.combined_score || 0;
+                const graphScore = parentScore * (conn.strength || 1.0) * edgeDecay * 0.5;
+
+                graphExpanded.push({
+                  id: conn.id,
+                  memory_type_int: conn.type,
+                  _pool: 'graph',
+                  _graph_score: graphScore,
+                  _hop: 1,
+                  _parent_id: seed.id,
+                });
+
+                if (intentConfig.maxDepth >= 2) {
+                  const out2 = await supabase.query('memory_connections', { select: '*', filter: { source_id: conn.id } });
+                  const in2 = await supabase.query('memory_connections', { select: '*', filter: { target_id: conn.id } });
+                  const hop2Connections = [
+                    ...(Array.isArray(out2) ? out2 : []).map((c: any) => ({ id: c.target_id, type: c.target_type, strength: c.strength, created_at: c.created_at, persistent: c.persistent })),
+                    ...(Array.isArray(in2) ? in2 : []).map((c: any) => ({ id: c.source_id, type: c.source_type, strength: c.strength, created_at: c.created_at, persistent: c.persistent })),
+                  ];
+                  for (const conn2 of hop2Connections) {
+                    if (visited.has(conn2.id) || nodesVisited >= intentConfig.nodeBudget) continue;
+                    visited.add(conn2.id);
+                    nodesVisited++;
+                    const edgeDecay2 = computeEdgeDecay(conn2.created_at, intentConfig.halfLifeDays, conn2.persistent);
+                    const graphScore2 = graphScore * (conn2.strength || 1.0) * edgeDecay2 * 0.5;
+                    graphExpanded.push({
+                      id: conn2.id,
+                      memory_type_int: conn2.type,
+                      _pool: 'graph',
+                      _graph_score: graphScore2,
+                      _hop: 2,
+                      _parent_id: conn.id,
+                    });
+                  }
+                }
+              }
+            }
+
+            // Batch-fetch content for graph-expanded memories
+            if (graphExpanded.length > 0) {
+              const byType = new Map<string, string[]>();
+              for (const g of graphExpanded) {
+                const typeName = intToType[g.memory_type_int] || 'core';
+                const table = tableMap[typeName] || 'core_memories';
+                if (!byType.has(table)) byType.set(table, []);
+                byType.get(table)!.push(g.id);
+              }
+              const contentMap = new Map<string, any>();
+              for (const [table, ids] of byType) {
+                const idList = ids.join(',');
+                const resp = await fetch(`${url}/rest/v1/${table}?id=in.(${idList})&select=id,content,memory_type,similarity:salience,outcome_score,created_at`, {
+                  headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' }
+                });
+                const rows = await resp.json();
+                if (Array.isArray(rows)) {
+                  for (const row of rows) contentMap.set(row.id, row);
+                }
+              }
+              graphExpanded = graphExpanded.filter(g => contentMap.has(g.id)).map(g => {
+                const mem = contentMap.get(g.id);
+                return { ...mem, ...g, content: mem.content, created_at: mem.created_at, outcome_score: mem.outcome_score || 0 };
+              });
+            }
+          } catch { /* graph expansion failure shouldn't block retrieval */ }
+        }
+
+        // === SOMATIC BRIDGE + VALENCE ===
+        const allCandidates = [...tagged, ...graphExpanded];
+        const memoryIds = allCandidates.map((r: any) => r.id).filter(Boolean);
         let somaticBridge: any[] = [];
+        const somaticByMemoryId = new Map<string, any>();
+
         if (memoryIds.length > 0) {
           try {
             const allAnchors = await supabase.query('somatic_anchors', {
@@ -789,13 +934,49 @@ export class CognitiveCore extends McpAgent<Env> {
             });
             if (Array.isArray(allAnchors)) {
               somaticBridge = allAnchors.filter((a: any) => a.memory_id && memoryIds.includes(a.memory_id));
+              for (const a of somaticBridge) {
+                somaticByMemoryId.set(a.memory_id, a);
+              }
             }
           } catch { /* somatic tables may not exist yet */ }
         }
 
+        // === COMPOSITE SCORING ===
+        const scored = allCandidates.map((r: any) => {
+          const vectorSim = r.similarity || r.combined_score || 0;
+          const graphProximity = r._pool === 'graph' ? (r._graph_score || 0) : 1.0;
+          const anchor = somaticByMemoryId.get(r.id);
+          const somaticVal = computeSomaticValence(anchor, intentMode);
+          const composite = computeCompositeScore(vectorSim, graphProximity, r.created_at, r.outcome_score || 0, somaticVal, intentMode);
+          return { ...r, _composite_score: composite, _somatic_valence: anchor ? somaticVal : undefined };
+        });
+
+        scored.sort((a: any, b: any) => b._composite_score - a._composite_score);
+        const finalResults = scored.slice(0, limit);
+
+        // === CO-SURFACING ===
+        const finalIds = finalResults.map((r: any) => r.id).filter(Boolean);
+        if (finalIds.length >= 2) {
+          try {
+            const pairs: Promise<any>[] = [];
+            for (let i = 0; i < finalIds.length; i++) {
+              for (let j = i + 1; j < finalIds.length; j++) {
+                const [a, b] = finalIds[i] < finalIds[j] ? [finalIds[i], finalIds[j]] : [finalIds[j], finalIds[i]];
+                pairs.push(fetch(`${url}/rest/v1/rpc/record_co_surfacing`, {
+                  method: 'POST',
+                  headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ p_memory_a: a, p_memory_b: b })
+                }));
+              }
+            }
+            await Promise.allSettled(pairs);
+          } catch { /* co-surfacing failure shouldn't block results */ }
+        }
+
         const result: any = {
-          pool_breakdown: { core: coreResults.length, novelty: noveltyFiltered.length, edge: edgeResults.length },
-          results: tagged,
+          intent: intentMode,
+          pool_breakdown: { core: coreResults.length, novelty: noveltyFiltered.length, edge: edgeResults.length, graph: graphExpanded.length },
+          results: finalResults,
         };
         if (somaticBridge.length > 0) {
           result.somatic_bridge = somaticBridge;
