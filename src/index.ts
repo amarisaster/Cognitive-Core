@@ -2716,7 +2716,6 @@ export class CognitiveCore extends McpAgent<Env> {
             last_recalled: new Date().toISOString(),
           }, { id: args.anchor_id });
 
-          return {
             // === SOMATIC BRIDGE: somatic → semantic ===
             const bridgeAnchorIds = [args.anchor_id, ...resonated.map(r => r.id)];
             let linkedMemories: any[] = [];
