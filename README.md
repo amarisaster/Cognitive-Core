@@ -366,6 +366,17 @@ If you're using [Haven](https://github.com/amarisaster/Haven) as your companion 
 3. Hit **Test** — you should see 73 tools discovered
 4. Start a conversation. Your companion now has persistent memory, emotional state, identity, and everything else in the tool list above.
 
+#### Troubleshooting: `404` / `error code 1042` on Test
+
+If discovery fails with something like `streamable initialize 404: error code 1042` (or the same on the SSE connect), **this is not a CogCor bug** — the request never reaches CogCor. `1042` is Cloudflare's same-account loop protection: it blocks one Worker from fetching *another Worker on the same Cloudflare account* over its public `*.workers.dev` URL.
+
+It shows up when the app testing the connection (e.g. a self-hosted Haven backend) runs as a Worker on the **same Cloudflare account** as your CogCor deploy. Two ways to fix it:
+
+- **Easiest (no code):** deploy CogCor to a **separate Cloudflare account** (the free tier is fine), set your secrets there, and point the MCP URL at that account's `*.workers.dev`. Cross-account requests aren't blocked.
+- **Cleaner (small code change):** give the calling Worker a Cloudflare [service binding](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/) to CogCor so it's reached internally instead of over the public internet.
+
+Connecting from a browser-based client directly is unaffected — CogCor already sends permissive CORS headers.
+
 ### Customization Points
 
 Search for `CUSTOMIZATION SECTION` in `src/index.ts` to find everything you need to edit:
