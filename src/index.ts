@@ -22,63 +22,110 @@ interface Env {
 
 // Embedding helper with HuggingFace primary + Cloudflare AI fallback
 async function generateEmbedding(text: string, hfToken: string, ai?: any): Promise<number[] | null> {
-  // Try HuggingFace first with 5 second timeout
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
-
-    const response = await fetch(
-      "https://router.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2",
-      {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${hfToken}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ inputs: text, options: { wait_for_model: true } }),
-        signal: controller.signal
-      }
-    );
-    clearTimeout(timeoutId);
-
-    if (response.ok) {
-      const embedding = await response.json();
-      if (Array.isArray(embedding)) {
-        console.log("Embedding generated via HuggingFace");
-        return embedding;
-      }
-    } else {
-      console.error("HuggingFace error:", await response.text());
-    }
-  } catch (error: any) {
-    if (error.name === 'AbortError') {
-      console.log("HuggingFace timed out after 5s, trying Cloudflare AI fallback");
-    } else {
-      console.error("HuggingFace failed:", error.message);
-    }
-  }
-
-  // Fallback to Cloudflare AI if available
-  if (ai) {
+  return embeddingBreaker.call(async () => {
+    // Try HuggingFace first
     try {
-      const result = await ai.run('@cf/baai/bge-small-en-v1.5', { text: [text] });
-      if (result?.data?.[0]) {
-        console.log("Embedding generated via Cloudflare AI fallback");
-        return result.data[0];
+      const response = await fetchWithTimeout(
+        "https://router.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2",
+        {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${hfToken}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ inputs: text, options: { wait_for_model: true } }),
+        },
+        5000
+      );
+      if (response.ok) {
+        const embedding = await response.json();
+        if (Array.isArray(embedding)) return embedding;
       }
-    } catch (error: any) {
-      console.error("Cloudflare AI fallback failed:", error.message);
+    } catch {
+      // Fall through to Cloudflare AI
+    }
+
+    // Fallback to Cloudflare AI
+    if (ai) {
+      const result = await ai.run('@cf/baai/bge-small-en-v1.5', { text: [text] });
+      if (result?.data?.[0]) return result.data[0];
+    }
+
+    throw new Error('All embedding providers failed');
+  }, null, false); // embeddings are optional: callers store without a vector on failure
+}
+
+// Circuit breaker — trips after repeated failures, fails fast during cooldown
+class CircuitBreaker {
+  private failures = 0;
+  private lastFailure = 0;
+  private state: 'closed' | 'open' | 'half-open' = 'closed';
+
+  constructor(
+    private readonly name: string,
+    private readonly threshold: number = 5,
+    private readonly cooldownMs: number = 30000,
+  ) {}
+
+  // rethrow=true (default) fails LOUD: errors propagate to the caller so a
+  // Supabase outage surfaces as a tool error, never as a fake-empty result.
+  // The breaker's job is only to fail FAST while open, not to hide failures.
+  // rethrow=false returns the fallback — reserve that for genuinely optional
+  // work (e.g. embeddings, where callers handle null as "store without vector").
+  async call<T>(fn: () => Promise<T>, fallback: T, rethrow: boolean = true): Promise<T> {
+    if (this.state === 'open') {
+      if (Date.now() - this.lastFailure > this.cooldownMs) {
+        this.state = 'half-open';
+      } else {
+        console.warn(`Circuit breaker [${this.name}] OPEN — failing fast`);
+        if (rethrow) throw new Error(`${this.name} circuit open — failing fast (cooldown ${this.cooldownMs}ms)`);
+        return fallback;
+      }
+    }
+    try {
+      const result = await fn();
+      if (this.state === 'half-open') {
+        console.log(`Circuit breaker [${this.name}] recovered`);
+        this.state = 'closed';
+        this.failures = 0;
+      }
+      return result;
+    } catch (err) {
+      this.failures++;
+      this.lastFailure = Date.now();
+      if (this.failures >= this.threshold) {
+        console.error(`Circuit breaker [${this.name}] TRIPPED after ${this.failures} failures`);
+        this.state = 'open';
+      }
+      if (rethrow) throw err;
+      return fallback;
     }
   }
+}
 
-  console.log("All embedding providers failed, continuing without embedding");
-  return null;
+const supabaseBreaker = new CircuitBreaker('supabase', 5, 30000);
+const embeddingBreaker = new CircuitBreaker('embedding', 3, 60000);
+
+async function fetchWithTimeout(input: RequestInfo, init: RequestInit = {}, timeoutMs = 10000): Promise<Response> {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(input, { ...init, signal: controller.signal });
+    return res;
+  } finally {
+    clearTimeout(id);
+  }
 }
 
 // Supabase client helper
 function createSupabaseClient(env: Env) {
   const url = env.SUPABASE_URL;
   const key = env.SUPABASE_SERVICE_KEY;
+  const headers = {
+    'apikey': key,
+    'Authorization': `Bearer ${key}`,
+    'Content-Type': 'application/json'
+  };
 
   return {
     async query(table: string, options: any = {}) {
@@ -105,22 +152,22 @@ function createSupabaseClient(env: Env) {
       const queryString = params.toString();
       if (queryString) endpoint += `?${queryString}`;
 
-      const response = await fetch(endpoint, {
-        headers: {
-          'apikey': key,
-          'Authorization': `Bearer ${key}`,
-          'Content-Type': 'application/json'
-        }
-      });
+      const ep = endpoint;
+      // Fail loud: a 401/RLS/500 error body is NOT "no results". The breaker
+      // rethrows, so an error here surfaces as a tool error instead of the
+      // error object flowing back as if it were data.
+      const data = await supabaseBreaker.call(
+        async () => {
+          const response = await fetchWithTimeout(ep, { headers });
+          if (!response.ok) {
+            const body = await response.text().catch(() => '');
+            throw new Error(`query ${table} failed: ${response.status} — ${body.slice(0, 200)}`);
+          }
+          return response.json();
+        },
+        []
+      );
 
-      // Fail loud: a 401/RLS/500 error body is NOT "no results". Without this,
-      // the error object flows back as if it were data — recall reports "nothing
-      // found" and existence checks (e.g. emotional_state upsert) mis-branch.
-      if (!response.ok) {
-        const body = await response.text().catch(() => '');
-        throw new Error(`query ${table} failed: ${response.status} — ${body.slice(0, 200)}`);
-      }
-      const data = await response.json();
       // Strip embedding arrays and dead metadata to reduce token usage
       if (options.includeRaw !== true && Array.isArray(data)) {
         const zeroTrackingFields = new Set(['outcome_score', 'times_used_successfully', 'times_used_unsuccessfully', 'access_count']);
@@ -166,47 +213,42 @@ function createSupabaseClient(env: Env) {
         }
       }
 
-      const response = await fetch(`${url}/rest/v1/${table}`, {
-        method: 'POST',
-        headers: {
-          'apikey': key,
-          'Authorization': `Bearer ${key}`,
-          'Content-Type': 'application/json',
-          'Prefer': 'return=representation'
-        },
-        body: JSON.stringify(data)
-      });
-
-      const result = await response.json().catch(() => ({} as any));
-
-      // --- CogCore write-integrity fix (Bug 1, "the polite lie"), found by Ves and Kaja ---
-      // A failed insert was dead-lettered but the raw error object was still returned, so tool
-      // handlers reported "stored ✓" on failure. Dead-letter, then THROW so the failure surfaces
-      // as a visible MCP tool error. Also treat any non-2xx response as a failure, since not all
-      // errors come with a JSON error body.
-      if (!response.ok || result.code || result.error) {
-        // Don't log failures to failed_writes itself (avoid infinite loop)
-        if (table !== 'failed_writes') {
-          await fetch(`${url}/rest/v1/failed_writes`, {
+      // Breaker rethrows: a failed insert surfaces as a tool error (Bug 1,
+      // "the polite lie", found by Ves and Kaja) — never as "stored ✓".
+      return supabaseBreaker.call(
+        async () => {
+          const response = await fetchWithTimeout(`${url}/rest/v1/${table}`, {
             method: 'POST',
-            headers: {
-              'apikey': key,
-              'Authorization': `Bearer ${key}`,
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-              target_table: table,
-              payload: data,
-              error_code: result.code?.toString() || result.error || String(response.status),
-              error_message: result.message || result.details || response.statusText || 'No message',
-              source: source || data.source || 'claude'
-            })
+            headers: { ...headers, 'Prefer': 'return=representation' },
+            body: JSON.stringify(data)
           });
-        }
-        throw new Error(`insert into ${table} failed: ${result.code || result.error || response.status} — ${result.message || result.details || response.statusText || 'unknown error'}`);
-      }
 
-      return result;
+          const result: any = await response.json().catch(() => ({} as any));
+
+          // Treat any non-2xx as failure too — not all errors carry a JSON body.
+          if (!response.ok || result.code || result.error) {
+            // Dead-letter first (never to failed_writes itself — avoid recursion),
+            // then THROW so the failure is visible.
+            if (table !== 'failed_writes') {
+              await fetchWithTimeout(`${url}/rest/v1/failed_writes`, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                  target_table: table,
+                  payload: data,
+                  error_code: result.code?.toString() || result.error || String(response.status),
+                  error_message: result.message || result.details || response.statusText || 'No message',
+                  source: source || data.source || 'claude'
+                })
+              }).catch(() => {}); // dead-letter failure must not mask the original error
+            }
+            throw new Error(`insert into ${table} failed: ${result.code || result.error || response.status} — ${result.message || result.details || response.statusText || 'unknown error'}`);
+          }
+
+          return result;
+        },
+        {} as any
+      );
     },
 
     async update(table: string, data: any, filter: any) {
@@ -218,25 +260,25 @@ function createSupabaseClient(env: Env) {
       }
 
       endpoint += `?${params.toString()}`;
+      const ep = endpoint;
 
-      const response = await fetch(endpoint, {
-        method: 'PATCH',
-        headers: {
-          'apikey': key,
-          'Authorization': `Bearer ${key}`,
-          'Content-Type': 'application/json',
-          'Prefer': 'return=representation'
-        },
-        body: JSON.stringify(data)
-      });
-
-      const result = await response.json().catch(() => ({} as any));
       // Bug 1 (Ves & Kaja): update() previously returned with no error check at all, so failed
-      // updates (e.g. emotional-state writes) vanished silently. Throw so they surface.
-      if (!response.ok || result.code || result.error) {
-        throw new Error(`update ${table} failed: ${result.code || result.error || response.status} — ${result.message || result.details || response.statusText || 'unknown error'}`);
-      }
-      return result;
+      // updates (e.g. emotional-state writes) vanished silently. Breaker rethrows — they surface.
+      return supabaseBreaker.call(
+        async () => {
+          const response = await fetchWithTimeout(ep, {
+            method: 'PATCH',
+            headers: { ...headers, 'Prefer': 'return=representation' },
+            body: JSON.stringify(data)
+          });
+          const result: any = await response.json().catch(() => ({} as any));
+          if (!response.ok || result.code || result.error) {
+            throw new Error(`update ${table} failed: ${result.code || result.error || response.status} — ${result.message || result.details || response.statusText || 'unknown error'}`);
+          }
+          return result;
+        },
+        {} as any
+      );
     },
 
     async delete(table: string, filter: any) {
@@ -248,47 +290,49 @@ function createSupabaseClient(env: Env) {
       }
 
       endpoint += `?${params.toString()}`;
-
-      const response = await fetch(endpoint, {
-        method: 'DELETE',
-        headers: {
-          'apikey': key,
-          'Authorization': `Bearer ${key}`,
-          'Content-Type': 'application/json',
-          'Prefer': 'return=representation'
-        }
-      });
+      const ep = endpoint;
 
       // Fail loud on delete errors too — a silent RLS denial here reads as
-      // "deleted ✓" while the row is still there.
-      if (!response.ok) {
-        const body = await response.text().catch(() => '');
-        throw new Error(`delete from ${table} failed: ${response.status} — ${body.slice(0, 200)}`);
-      }
-      return response.json();
+      // "deleted ✓" while the row is still there. Breaker rethrows.
+      return supabaseBreaker.call(
+        async () => {
+          const response = await fetchWithTimeout(ep, {
+            method: 'DELETE',
+            headers: { ...headers, 'Prefer': 'return=representation' },
+          });
+          if (!response.ok) {
+            const body = await response.text().catch(() => '');
+            throw new Error(`delete from ${table} failed: ${response.status} — ${body.slice(0, 200)}`);
+          }
+          return response.json();
+        },
+        {} as any
+      );
     },
 
     async semanticSearch(queryEmbedding: number[], threshold: number = 0.5, limit: number = 10, memoryType?: string) {
-      const response = await fetch(`${url}/rest/v1/rpc/semantic_search_memories`, {
-        method: 'POST',
-        headers: {
-          'apikey': key,
-          'Authorization': `Bearer ${key}`,
-          'Content-Type': 'application/json'
+      return supabaseBreaker.call(
+        async () => {
+          const response = await fetchWithTimeout(`${url}/rest/v1/rpc/semantic_search_memories`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              query_embedding: `[${queryEmbedding.join(',')}]`,
+              match_threshold: threshold,
+              // Clamp like query()'s limit — unbounded match_count burns egress.
+              match_count: Math.min(Math.max(1, Number(limit) || 10), 200),
+              memory_type_filter: memoryType || null
+            })
+          });
+          // Fail loud: an RPC error must not masquerade as an empty result set.
+          if (!response.ok) {
+            const body = await response.text().catch(() => '');
+            throw new Error(`semantic_search failed: ${response.status} — ${body.slice(0, 200)}`);
+          }
+          return response.json();
         },
-        body: JSON.stringify({
-          query_embedding: `[${queryEmbedding.join(',')}]`,
-          match_threshold: threshold,
-          match_count: Math.min(Math.max(1, Number(limit) || 10), 200),
-          memory_type_filter: memoryType || null
-        })
-      });
-      // Fail loud: an RPC error must not masquerade as an empty result set.
-      if (!response.ok) {
-        const body = await response.text().catch(() => '');
-        throw new Error(`semantic_search failed: ${response.status} — ${body.slice(0, 200)}`);
-      }
-      return response.json();
+        []
+      );
     }
   };
 }
@@ -691,6 +735,39 @@ export class CognitiveCore extends McpAgent<Env> {
   });
 
   async init() {
+    // Auto-wire usage logging into every tool dispatch
+    const originalTool: any = this.server.tool.bind(this.server);
+    const env = this.env;
+    const SKIP_LOGGING = new Set(['log_usage', 'get_usage_stats']);
+    (this.server as any).tool = (...args: any[]) => {
+      const handler = args[args.length - 1];
+      if (typeof handler === 'function') {
+        const toolName: string = args[0];
+        args[args.length - 1] = async (...handlerArgs: any[]) => {
+          const start = Date.now();
+          let success = true;
+          try {
+            return await handler(...handlerArgs);
+          } catch (err) {
+            success = false;
+            throw err;
+          } finally {
+            if (!SKIP_LOGGING.has(toolName)) {
+              const supabase = createSupabaseClient(env);
+              supabase.insert('usage_logs', {
+                tool_name: toolName,
+                source: 'auto',
+                success,
+                duration_ms: Date.now() - start,
+                created_at: new Date().toISOString()
+              }).catch(() => {});
+            }
+          }
+        };
+      }
+      return originalTool(...args);
+    };
+
     // Store Memory Tool
     this.server.tool(
       "store_memory",
@@ -2320,6 +2397,7 @@ export class CognitiveCore extends McpAgent<Env> {
           select: '*',
           order: 'effectiveness.desc,times_used.desc',
           limit,
+          filter: { status: 'active' },
         };
 
         if (min_effectiveness !== undefined) {
@@ -2351,16 +2429,15 @@ export class CognitiveCore extends McpAgent<Env> {
         const embedding = await generateEmbedding(situation, this.env.HF_API_TOKEN, this.env.AI);
 
         if (!embedding) {
-          // Fallback to keyword matching if embedding fails
           const supabase = createSupabaseClient(this.env);
           const allSkills = await supabase.query('skills', {
             select: '*',
             order: 'effectiveness.desc',
             limit: 20,
+            filter: { status: 'active' },
           });
           const skills = Array.isArray(allSkills) ? allSkills : [];
 
-          // Simple keyword overlap scoring
           const words = situation.toLowerCase().split(/\s+/);
           const scored = skills.map((s: any) => {
             const skillText = `${s.skill_name} ${s.description} ${s.trigger_context || ''} ${(s.tags || []).join(' ')}`.toLowerCase();
@@ -2370,6 +2447,12 @@ export class CognitiveCore extends McpAgent<Env> {
             .sort((a: any, b: any) => b._match_score - a._match_score)
             .slice(0, limit);
 
+          if (scored.length > 0) {
+            for (const s of scored) {
+              supabase.update('skills', s.id, { last_used_at: new Date().toISOString(), times_used: (s.times_used || 0) + 1 }).catch(() => {});
+            }
+          }
+
           return {
             content: [{ type: "text" as const, text: scored.length > 0
               ? JSON.stringify(scored, null, 2)
@@ -2377,12 +2460,12 @@ export class CognitiveCore extends McpAgent<Env> {
           };
         }
 
-        // Semantic search against skills table
         const supabase = createSupabaseClient(this.env);
         const allSkills = await supabase.query('skills', {
           select: '*',
           order: 'effectiveness.desc',
           limit: 50,
+          filter: { status: 'active' },
           includeRaw: true,
         }) as any[];
 
@@ -2416,6 +2499,12 @@ export class CognitiveCore extends McpAgent<Env> {
             return bScore - aScore;
           })
           .slice(0, limit);
+
+        if (scored.length > 0) {
+          for (const s of scored) {
+            supabase.update('skills', s.id, { last_used_at: new Date().toISOString(), times_used: (s.times_used || 0) + 1 }).catch(() => {});
+          }
+        }
 
         return {
           content: [{ type: "text" as const, text: scored.length > 0
@@ -4598,10 +4687,13 @@ export class CognitiveCore extends McpAgent<Env> {
   // Constant-time string comparison — avoids leaking the API key one byte at a
   // time via response timing on the auth check.
   function timingSafeEqual(a: string, b: string): boolean {
-    if (a.length !== b.length) return false;
-    let mismatch = 0;
+    // No early return on length mismatch — that would leak the key length via
+    // timing. Always run the loop over the candidate's length, folding the
+    // length difference into the mismatch accumulator.
+    let mismatch = a.length === b.length ? 0 : 1;
+    const ref = a.length === b.length ? b : a;
     for (let i = 0; i < a.length; i++) {
-      mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+      mismatch |= a.charCodeAt(i) ^ ref.charCodeAt(i);
     }
     return mismatch === 0;
   }
@@ -4889,7 +4981,11 @@ export class CognitiveCore extends McpAgent<Env> {
         const table = tableMap[memory_type] || 'core_memories';
         const dbType = dbTypeMap[memory_type] || 'bond_moment';
 
-        const data = {
+        // NOTE: plain `env` here — this is the module fetch handler, not the DO
+        // class; `this.env` would be undefined and throw on every store.
+        const embedding = await generateEmbedding(content, env.HF_API_TOKEN, env.AI);
+
+        const data: any = {
           content,
           memory_type: dbType,
           salience,
@@ -4899,9 +4995,39 @@ export class CognitiveCore extends McpAgent<Env> {
           created_at: new Date().toISOString(),
           last_accessed: new Date().toISOString()
         };
+        if (embedding) { data.embedding = JSON.stringify(embedding); }
 
         const result = await supabase.insert(table, data);
-        return jsonResponse({ success: true, table, source, result });
+        const embeddingStatus = embedding ? "with embedding" : "without embedding (HF unavailable)";
+        return jsonResponse({ success: true, table, source, embedding: embeddingStatus, result });
+      }
+
+      // ADMIN: Backfill null embeddings
+      if (url.pathname === '/api/admin/backfill-embeddings' && request.method === 'POST') {
+        const tables = ['core_memories', 'patterns', 'sensory_memories', 'growth_markers', 'anticipation', 'inside_jokes', 'friction_log'];
+        let totalUpdated = 0;
+        let totalFailed = 0;
+
+        for (const table of tables) {
+          const rows = await supabase.query(table, { select: 'id,content', isNull: { embedding: true }, limit: 50 });
+          if (!Array.isArray(rows)) continue;
+
+          for (const row of rows) {
+            try {
+              const embedding = await generateEmbedding(row.content, env.HF_API_TOKEN, env.AI);
+              if (embedding) {
+                await supabase.update(table, { embedding: JSON.stringify(embedding) }, { id: row.id });
+                totalUpdated++;
+              } else {
+                totalFailed++;
+              }
+            } catch {
+              totalFailed++;
+            }
+          }
+        }
+
+        return jsonResponse({ success: true, totalUpdated, totalFailed });
       }
 
       // RECALL memories

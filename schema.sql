@@ -522,6 +522,7 @@ CREATE TABLE usage_logs (
   source TEXT DEFAULT 'claude',
   parameters JSONB,
   success BOOLEAN DEFAULT TRUE,
+  duration_ms INTEGER,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
