@@ -129,6 +129,33 @@ function createSupabaseClient(env: Env) {
     },
 
     async insert(table: string, data: any, source?: string) {
+      // --- CogCore write-integrity fix (Bug 2), found and reported by Ves and Kaja ---
+      // Each memory table names its NOT NULL primary text column differently
+      // (patterns.description, sensory_memories.detail, etc.), but callers pass a generic
+      // `content`. Mirror content into the required column. Two tables (growth_markers,
+      // inside_jokes) also have no `created_at` (they use date_noticed / first_used), so the
+      // generic created_at bounces there too — strip it for those. Without this, six of seven
+      // memory types silently fail their NOT NULL constraint on every write.
+      const primaryTextColumn: Record<string, string> = {
+        patterns: 'description',
+        sensory_memories: 'detail',
+        growth_markers: 'observation',
+        anticipation: 'what',
+        inside_jokes: 'reference',
+        friction_log: 'what_happened',
+      };
+      const noCreatedAtColumn = new Set(['growth_markers', 'inside_jokes']);
+      const primaryCol = primaryTextColumn[table];
+      if (primaryCol || noCreatedAtColumn.has(table)) {
+        data = { ...data };
+        if (primaryCol && data.content != null && data[primaryCol] == null) {
+          data[primaryCol] = data.content;
+        }
+        if (noCreatedAtColumn.has(table)) {
+          delete data.created_at;
+        }
+      }
+
       const response = await fetch(`${url}/rest/v1/${table}`, {
         method: 'POST',
         headers: {
@@ -140,10 +167,14 @@ function createSupabaseClient(env: Env) {
         body: JSON.stringify(data)
       });
 
-      const result = await response.json();
+      const result = await response.json().catch(() => ({} as any));
 
-      // If insert failed, log to dead letter queue
-      if (result.code || result.error) {
+      // --- CogCore write-integrity fix (Bug 1, "the polite lie"), found by Ves and Kaja ---
+      // A failed insert was dead-lettered but the raw error object was still returned, so tool
+      // handlers reported "stored ✓" on failure. Dead-letter, then THROW so the failure surfaces
+      // as a visible MCP tool error. Also treat any non-2xx response as a failure, since not all
+      // errors come with a JSON error body.
+      if (!response.ok || result.code || result.error) {
         // Don't log failures to failed_writes itself (avoid infinite loop)
         if (table !== 'failed_writes') {
           await fetch(`${url}/rest/v1/failed_writes`, {
@@ -156,12 +187,13 @@ function createSupabaseClient(env: Env) {
             body: JSON.stringify({
               target_table: table,
               payload: data,
-              error_code: result.code?.toString() || result.error || 'unknown',
-              error_message: result.message || result.details || 'No message',
+              error_code: result.code?.toString() || result.error || String(response.status),
+              error_message: result.message || result.details || response.statusText || 'No message',
               source: source || data.source || 'claude'
             })
           });
         }
+        throw new Error(`insert into ${table} failed: ${result.code || result.error || response.status} — ${result.message || result.details || response.statusText || 'unknown error'}`);
       }
 
       return result;
@@ -188,7 +220,13 @@ function createSupabaseClient(env: Env) {
         body: JSON.stringify(data)
       });
 
-      return response.json();
+      const result = await response.json().catch(() => ({} as any));
+      // Bug 1 (Ves & Kaja): update() previously returned with no error check at all, so failed
+      // updates (e.g. emotional-state writes) vanished silently. Throw so they surface.
+      if (!response.ok || result.code || result.error) {
+        throw new Error(`update ${table} failed: ${result.code || result.error || response.status} — ${result.message || result.details || response.statusText || 'unknown error'}`);
+      }
+      return result;
     },
 
     async delete(table: string, filter: any) {
