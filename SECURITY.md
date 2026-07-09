@@ -14,7 +14,7 @@ I'll respond as fast as I can.
 
 ### Authentication
 
-- **MCP endpoints** (`/sse`, `/mcp`) — Secured through Cloudflare Durable Objects session management
+- **MCP endpoints** (`/sse`, `/sse/message`, `/mcp`) — Require the `MCP_API_KEY`, same as REST. Send it as an `Authorization: Bearer <MCP_API_KEY>` header, or — for MCP clients that can't set headers — as a `?k=<MCP_API_KEY>` (or `?key=`) query parameter. Requests without a valid key receive `401 Unauthorized`. **Note:** Durable Object session management is *not* authentication — earlier versions gated only `/api/*`, which left these MCP endpoints open to anyone who knew the worker URL. Update if you're running an older fork.
 - **REST API endpoints** (`/api/*`) — Require `Authorization: Bearer <MCP_API_KEY>` header on every request. Requests without a valid key receive `401 Unauthorized`.
 - **Health check** (`/health`) — Public, returns only service status. No sensitive data.
 - **Rate limiting** — Not built in. The `MCP_API_KEY` is the only barrier. If you're deploying publicly, add rate limiting at the Cloudflare level (Workers > your worker > Settings > Rate Limiting) or use [Cloudflare's Rate Limiting Rules](https://developers.cloudflare.com/waf/rate-limiting-rules/) on your zone. Even a basic limit (100 requests/minute per IP) prevents brute force and abuse.

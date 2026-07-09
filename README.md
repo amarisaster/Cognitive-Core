@@ -352,7 +352,9 @@ Your CogCor is now live at `https://cognitive-core.YOUR-SUBDOMAIN.workers.dev`.
 5. Connect via MCP:
 - SSE endpoint: `https://your-worker.workers.dev/sse`
 - Streamable HTTP: `https://your-worker.workers.dev/mcp`
-- REST API: `https://your-worker.workers.dev/api/*` (requires `Authorization: Bearer <MCP_API_KEY>` header)
+- REST API: `https://your-worker.workers.dev/api/*`
+
+All endpoints (MCP and REST) require your `MCP_API_KEY`. MCP clients that support headers send `Authorization: Bearer <MCP_API_KEY>`; clients that can't set headers can pass it as a `?k=<MCP_API_KEY>` (or `?key=`) query parameter. Only `/health` is public.
 
 ### Connecting to Haven
 
