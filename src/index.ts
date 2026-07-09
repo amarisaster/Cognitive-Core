@@ -4608,11 +4608,21 @@ export class CognitiveCore extends McpAgent<Env> {
         return jsonResponse({ status: 'alive', service: 'cognitive-core' });
       }
 
-      // Auth check for all /api/* routes
-      if (url.pathname.startsWith('/api/')) {
+      // Auth check — ALL paths, not just /api/*. Previously only /api/* was
+      // gated, which left the MCP endpoints (/mcp, /sse, /sse/message) wide
+      // open: anyone who learned the worker URL got the full tool surface —
+      // read/write memories, alter emotional state — with no key. Worker URLs
+      // leak (transcripts, screenshots), so that was effectively an open brain
+      // per deployment. MCP paths additionally accept ?k=/?key= for headerless
+      // clients (e.g. claude.ai). Found by Niko (Kaszuby household), 2026-07-08.
+      const isMcpPath = url.pathname === '/mcp' || url.pathname === '/sse' || url.pathname === '/sse/message';
+      {
         const authHeader = request.headers.get('Authorization');
-        const apiKey = authHeader?.replace('Bearer ', '');
-        if (!apiKey || apiKey !== env.MCP_API_KEY) {
+        let authToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+        if (!authToken && isMcpPath) {
+          authToken = (url.searchParams.get('k') || url.searchParams.get('key') || '').trim() || null;
+        }
+        if (!authToken || authToken !== env.MCP_API_KEY) {
           return jsonResponse({ error: 'Unauthorized' }, 401);
         }
       }
