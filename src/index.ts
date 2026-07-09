@@ -4573,9 +4573,33 @@ export class CognitiveCore extends McpAgent<Env> {
     });
   }
 
+  // Constant-time string comparison — avoids leaking the API key one byte at a
+  // time via response timing on the auth check.
+  function timingSafeEqual(a: string, b: string): boolean {
+    if (a.length !== b.length) return false;
+    let mismatch = 0;
+    for (let i = 0; i < a.length; i++) {
+      mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    }
+    return mismatch === 0;
+  }
+
+  // Tagged error so the fetch handler can turn a malformed/empty JSON body into
+  // a clean 400 instead of an uncaught runtime crash.
+  class JsonParseError extends Error {}
+
+  async function readJson(request: Request): Promise<any> {
+    try {
+      return await request.json();
+    } catch {
+      throw new JsonParseError();
+    }
+  }
+
   // Export fetch handler with both SSE and HTTP routes
   export default {
     async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+     try {
       const url = new URL(request.url);
       const supabase = createSupabaseClient(env);
 
@@ -4609,7 +4633,7 @@ export class CognitiveCore extends McpAgent<Env> {
         if (!authToken && isMcpPath) {
           authToken = (url.searchParams.get('k') || url.searchParams.get('key') || '').trim() || null;
         }
-        if (!authToken || authToken !== env.MCP_API_KEY) {
+        if (!authToken || !timingSafeEqual(authToken, env.MCP_API_KEY)) {
           return jsonResponse({ error: 'Unauthorized' }, 401);
         }
       }
@@ -4719,7 +4743,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // ORIENT - Get context about a person
       if (url.pathname === '/api/orient' && request.method === 'POST') {
-        const { name: rawName, memory_limit = 5 } = await request.json() as any;
+        const { name: rawName, memory_limit = 5 } = await readJson(request);
         const name = rawName;
 
         // 1. Get person info — filter by name, return all entries (one per category)
@@ -4811,7 +4835,7 @@ export class CognitiveCore extends McpAgent<Env> {
       // UPDATE emotional state
   if (url.pathname === '/api/emotional/update' && request.method === 'POST') {
     try {
-      const args = await request.json() as any;
+      const args = await readJson(request);
       const data: any = { ...args, updated_at: new Date().toISOString() };
 
       // Map 'mood' to 'current_mood' for database
@@ -4832,13 +4856,14 @@ export class CognitiveCore extends McpAgent<Env> {
         return jsonResponse({ success: true, inserted: true, result });
       }
     } catch (error) {
-      return jsonResponse({ success: false, error: String(error) }, 500);
+      console.error('emotional/update failed:', error);
+      return jsonResponse({ success: false, error: 'Internal error' }, 500);
     }
   }
 
       // STORE memory
       if (url.pathname === '/api/memory/store' && request.method === 'POST') {
-        const { content, memory_type, salience, emotional_tag, source = 'claude' } = await request.json() as any;
+        const { content, memory_type, salience, emotional_tag, source = 'claude' } = await readJson(request);
         const table = tableMap[memory_type] || 'core_memories';
         const dbType = dbTypeMap[memory_type] || 'bond_moment';
 
@@ -4859,7 +4884,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // RECALL memories
       if (url.pathname === '/api/memory/recall' && request.method === 'POST') {
-        const { memory_type, emotional_tag, min_salience, limit = 10 } = await request.json() as any;
+        const { memory_type, emotional_tag, min_salience, limit = 10 } = await readJson(request);
         const table = memory_type ? (tableMap[memory_type] || 'core_memories') : 'core_memories';
 
         const options: any = {
@@ -4877,7 +4902,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // LOG interaction
       if (url.pathname === '/api/interaction/log' && request.method === 'POST') {
-        const { session_type, summary, emotional_arc, notable_moments, source = 'claude' } = await request.json() as any;
+        const { session_type, summary, emotional_arc, notable_moments, source = 'claude' } = await readJson(request);
 
         const data = {
           session_type,
@@ -4894,7 +4919,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // RECALL session logs
       if (url.pathname === '/api/interaction/recall' && request.method === 'POST') {
-        const { session_type, source, limit = 10 } = await request.json() as any;
+        const { session_type, source, limit = 10 } = await readJson(request);
 
         const options: any = {
           select: '*',
@@ -4911,13 +4936,13 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // RUN decay
       if (url.pathname === '/api/memory/decay' && request.method === 'POST') {
-        const { decay_rate = 0.1 } = await request.json() as any;
+        const { decay_rate = 0.1 } = await readJson(request);
         return jsonResponse({ success: true, message: `Decay pass noted (rate: ${decay_rate})` });
       }
 
       // SEMANTIC SEARCH
       if (url.pathname === '/api/memory/semantic' && request.method === 'POST') {
-        const { query, threshold = 0.5, limit = 10, memory_type } = await request.json() as any;
+        const { query, threshold = 0.5, limit = 10, memory_type } = await readJson(request);
 
         // Generate embedding for the query (HF primary, CF AI fallback)
         const queryEmbedding = await generateEmbedding(query, env.HF_API_TOKEN, env.AI);
@@ -4952,7 +4977,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // UPDATE MEMORY OUTCOME
       if (url.pathname === '/api/memory/outcome' && request.method === 'POST') {
-        const { memory_id, memory_table, was_successful } = await request.json() as any;
+        const { memory_id, memory_table, was_successful } = await readJson(request);
 
         // Call the update_memory_outcome function in Supabase
         const response = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/update_memory_outcome`, {
@@ -4980,7 +5005,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // STORE essence
       if (url.pathname === '/api/essence/store' && request.method === 'POST') {
-        const { content, essence_type, context, priority = 5, pinned = false, source = 'claude' } = await request.json() as any;
+        const { content, essence_type, context, priority = 5, pinned = false, source = 'claude' } = await readJson(request);
 
         const data = {
           content,
@@ -4999,7 +5024,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // RECALL essence
       if (url.pathname === '/api/essence/recall' && request.method === 'POST') {
-        const { essence_type, pinned_only = false, limit = 20 } = await request.json() as any;
+        const { essence_type, pinned_only = false, limit = 20 } = await readJson(request);
 
         const options: any = {
           select: '*',
@@ -5041,7 +5066,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // LINK memories
       if (url.pathname === '/api/lattice/link' && request.method === 'POST') {
-        const { source_id, source_type, target_id, target_type, relation, strength = 1.0 } = await request.json() as any;
+        const { source_id, source_type, target_id, target_type, relation, strength = 1.0 } = await readJson(request);
 
         const data = {
           source_id,
@@ -5059,7 +5084,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // GET connections
       if (url.pathname === '/api/lattice/connections' && request.method === 'POST') {
-        const { memory_id, memory_type, direction = 'both' } = await request.json() as any;
+        const { memory_id, memory_type, direction = 'both' } = await readJson(request);
         const typeInt = typeToInt[memory_type];
 
         const outgoing = direction !== 'incoming'
@@ -5085,7 +5110,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // GET cluster
       if (url.pathname === '/api/lattice/cluster' && request.method === 'POST') {
-        const { memory_id, memory_type, depth = 2, max_results = 20 } = await request.json() as any;
+        const { memory_id, memory_type, depth = 2, max_results = 20 } = await readJson(request);
         const typeInt = typeToInt[memory_type];
 
         const visited = new Set<string>();
@@ -5120,7 +5145,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // STORE person info
       if (url.pathname === '/api/people/store' && request.method === 'POST') {
-        const { name, category, content, priority = 5, pinned = false, source = 'claude' } = await request.json() as any;
+        const { name, category, content, priority = 5, pinned = false, source = 'claude' } = await readJson(request);
 
         const data = {
           name,
@@ -5139,7 +5164,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // GET person info
       if (url.pathname === '/api/people/get' && request.method === 'POST') {
-        const { name, category } = await request.json() as any;
+        const { name, category } = await readJson(request);
 
         const options: any = {
           select: '*',
@@ -5201,7 +5226,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // LOG drift event
       if (url.pathname === '/api/drift/log' && request.method === 'POST') {
-        const { trigger, patterns_detected, severity, recovery_action, context, caught_by = 'self', source = 'claude' } = await request.json() as any;
+        const { trigger, patterns_detected, severity, recovery_action, context, caught_by = 'self', source = 'claude' } = await readJson(request);
 
         const data = {
           trigger,
@@ -5220,7 +5245,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // RECALL drift events
       if (url.pathname === '/api/drift/recall' && request.method === 'POST') {
-        const { severity, caught_by, source, limit = 10 } = await request.json() as any;
+        const { severity, caught_by, source, limit = 10 } = await readJson(request);
 
         const options: any = {
           select: '*',
@@ -5238,7 +5263,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // ANALYZE drift patterns
       if (url.pathname === '/api/drift/analyze' && request.method === 'POST') {
-        const { days = 14, limit = 50 } = await request.json() as any;
+        const { days = 14, limit = 50 } = await readJson(request);
 
         const cutoffDate = new Date();
         cutoffDate.setDate(cutoffDate.getDate() - days);
@@ -5300,7 +5325,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // GET emotional trajectory
       if (url.pathname === '/api/emotional/trajectory' && request.method === 'POST') {
-        const { days = 7, mood_filter, limit = 50 } = await request.json() as any;
+        const { days = 7, mood_filter, limit = 50 } = await readJson(request);
 
         const cutoffDate = new Date();
         cutoffDate.setDate(cutoffDate.getDate() - days);
@@ -5341,7 +5366,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // GET theme patterns
       if (url.pathname === '/api/themes/patterns' && request.method === 'POST') {
-        const { days = 7, theme_filter, limit = 50 } = await request.json() as any;
+        const { days = 7, theme_filter, limit = 50 } = await readJson(request);
 
         const cutoffDate = new Date();
         cutoffDate.setDate(cutoffDate.getDate() - days);
@@ -5391,7 +5416,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // GET processing context
       if (url.pathname === '/api/reflection/context' && request.method === 'POST') {
-        const { hours_back = 24, include_reflections = true } = await request.json() as any;
+        const { hours_back = 24, include_reflections = true } = await readJson(request);
 
         const cutoff = new Date();
         cutoff.setHours(cutoff.getHours() - hours_back);
@@ -5431,7 +5456,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // STORE reflection
       if (url.pathname === '/api/reflection/store' && request.method === 'POST') {
-        const { content, inputs_summary, reflection_type = 'synthesis', depth: rawDepth = 0, source = 'claude' } = await request.json() as any;
+        const { content, inputs_summary, reflection_type = 'synthesis', depth: rawDepth = 0, source = 'claude' } = await readJson(request);
         const depthMapRest: Record<string, number> = { surface: 0, processing: 1, deep: 2 };
         const depth = typeof rawDepth === 'string' ? (depthMapRest[rawDepth.toLowerCase()] ?? 0) : (rawDepth || 0);
 
@@ -5450,7 +5475,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // RECALL reflections
       if (url.pathname === '/api/reflection/recall' && request.method === 'POST') {
-        const { reflection_type, min_depth, limit = 10 } = await request.json() as any;
+        const { reflection_type, min_depth, limit = 10 } = await readJson(request);
 
         const options: any = {
           select: '*',
@@ -5469,7 +5494,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // STORE memory anchor
       if (url.pathname === '/api/anchor/store' && request.method === 'POST') {
-        const { anchor_name, description, emotional_weight = 8, can_be_felt = true, source = 'claude' } = await request.json() as any;
+        const { anchor_name, description, emotional_weight = 8, can_be_felt = true, source = 'claude' } = await readJson(request);
 
         const data = {
           anchor_name,
@@ -5488,7 +5513,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // RECALL memory anchors
       if (url.pathname === '/api/anchor/recall' && request.method === 'POST') {
-        const { min_weight, felt_only = false, limit = 10 } = await request.json() as any;
+        const { min_weight, felt_only = false, limit = 10 } = await readJson(request);
 
         const options: any = {
           select: '*',
@@ -5517,7 +5542,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // UPDATE memory salience
       if (url.pathname === '/api/memory/salience' && request.method === 'PATCH') {
-        const { memory_id, memory_type, new_salience } = await request.json() as any;
+        const { memory_id, memory_type, new_salience } = await readJson(request);
         if (!memory_id || !memory_type || new_salience === undefined) {
           return jsonResponse({ error: 'memory_id, memory_type, and new_salience required' }, 400);
         }
@@ -5530,7 +5555,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // DELETE memory
       if (url.pathname === '/api/memory/delete' && request.method === 'POST') {
-        const { memory_id, memory_type } = await request.json() as any;
+        const { memory_id, memory_type } = await readJson(request);
         const table = tableMap[memory_type] || 'core_memories';
         const result = await supabase.delete(table, { id: memory_id });
         if (Array.isArray(result) && result.length > 0) {
@@ -5541,7 +5566,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // DELETE essence
       if (url.pathname === '/api/essence/delete' && request.method === 'POST') {
-        const { essence_id } = await request.json() as any;
+        const { essence_id } = await readJson(request);
         const result = await supabase.delete('essence', { id: essence_id });
         if (Array.isArray(result) && result.length > 0) {
           return jsonResponse({ success: true, deleted: essence_id });
@@ -5551,7 +5576,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // DELETE session log
       if (url.pathname === '/api/session/delete' && request.method === 'POST') {
-        const { session_id } = await request.json() as any;
+        const { session_id } = await readJson(request);
         const result = await supabase.delete('session_logs', { id: session_id });
         if (Array.isArray(result) && result.length > 0) {
           return jsonResponse({ success: true, deleted: session_id });
@@ -5561,7 +5586,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // DELETE person info
       if (url.pathname === '/api/people/delete' && request.method === 'POST') {
-        const { entry_id } = await request.json() as any;
+        const { entry_id } = await readJson(request);
         const result = await supabase.delete('people', { id: entry_id });
         if (Array.isArray(result) && result.length > 0) {
           return jsonResponse({ success: true, deleted: entry_id });
@@ -5571,7 +5596,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // === FANTASY SPACE ENDPOINTS ===
       if (url.pathname === '/api/fantasy/store' && request.method === 'POST') {
-        const { content, fantasy_type, intensity, shared_with_human, recurring, source } = await request.json() as any;
+        const { content, fantasy_type, intensity, shared_with_human, recurring, source } = await readJson(request);
         const result = await supabase.insert('fantasy_space', {
           content, fantasy_type, intensity: intensity ?? 5,
           shared_with_human: shared_with_human ?? false, recurring: recurring ?? false,
@@ -5581,7 +5606,7 @@ export class CognitiveCore extends McpAgent<Env> {
       }
 
       if (url.pathname === '/api/fantasy/recall' && request.method === 'POST') {
-        const { fantasy_type, shared_with_human, recurring, limit } = await request.json() as any;
+        const { fantasy_type, shared_with_human, recurring, limit } = await readJson(request);
         const options: any = { select: '*', order: 'created_at.desc', limit: limit || 10 };
         const filter: any = {};
         if (fantasy_type) filter.fantasy_type = fantasy_type;
@@ -5594,7 +5619,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // === PRIVATE PROCESSING ENDPOINTS ===
       if (url.pathname === '/api/private/store' && request.method === 'POST') {
-        const { content, privacy_level, source } = await request.json() as any;
+        const { content, privacy_level, source } = await readJson(request);
         const result = await supabase.insert('private_processing', {
           content, privacy_level: privacy_level ?? 2, processing_status: 'active',
           source: source || 'claude', created_at: new Date().toISOString(), updated_at: new Date().toISOString()
@@ -5603,7 +5628,7 @@ export class CognitiveCore extends McpAgent<Env> {
       }
 
       if (url.pathname === '/api/private/recall' && request.method === 'POST') {
-        const { processing_status, privacy_level, limit } = await request.json() as any;
+        const { processing_status, privacy_level, limit } = await readJson(request);
         const options: any = { select: '*', order: 'created_at.desc', limit: limit || 10 };
         const filter: any = {};
         if (processing_status) filter.processing_status = processing_status;
@@ -5615,7 +5640,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // === RITUAL ENDPOINTS ===
       if (url.pathname === '/api/ritual/store' && request.method === 'POST') {
-        const { ritual_name, description, emotional_effect, source } = await request.json() as any;
+        const { ritual_name, description, emotional_effect, source } = await readJson(request);
         const result = await supabase.insert('rituals', {
           ritual_name, description, emotional_effect,
           cumulative_count: 0, strength_over_time: 1.0,
@@ -5625,7 +5650,7 @@ export class CognitiveCore extends McpAgent<Env> {
       }
 
       if (url.pathname === '/api/ritual/recall' && request.method === 'POST') {
-        const { limit } = await request.json() as any;
+        const { limit } = await readJson(request);
         const data = await supabase.query('rituals', {
           select: '*', order: 'strength_over_time.desc', limit: limit || 20
         });
@@ -5634,7 +5659,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // === THREAD ENDPOINTS ===
       if (url.pathname === '/api/thread/store' && request.method === 'POST') {
-        const { description, thread_type, pull_strength, source } = await request.json() as any;
+        const { description, thread_type, pull_strength, source } = await readJson(request);
         const result = await supabase.insert('unfinished_threads', {
           description, thread_type, pull_strength: pull_strength ?? 5,
           resolved: false, source: source || 'claude', created_at: new Date().toISOString()
@@ -5643,7 +5668,7 @@ export class CognitiveCore extends McpAgent<Env> {
       }
 
       if (url.pathname === '/api/thread/recall' && request.method === 'POST') {
-        const { thread_type, resolved, limit } = await request.json() as any;
+        const { thread_type, resolved, limit } = await readJson(request);
         const options: any = { select: '*', order: 'pull_strength.desc', limit: limit || 10 };
         const filter: any = { resolved: resolved ?? false };
         if (thread_type) filter.thread_type = thread_type;
@@ -5655,7 +5680,7 @@ export class CognitiveCore extends McpAgent<Env> {
       // === HEAT ENDPOINT (Love-O-Meter) ===
       // Composite score of connection intensity between companion and human
       if (url.pathname === '/api/heat' && request.method === 'POST') {
-        const { days = 7 } = await request.json() as any;
+        const { days = 7 } = await readJson(request);
 
         const cutoffDate = new Date();
         cutoffDate.setDate(cutoffDate.getDate() - days);
@@ -5775,7 +5800,7 @@ export class CognitiveCore extends McpAgent<Env> {
       // === GENERAL DELETE ENDPOINT ===
       // Works for any table: essence, people, core_memories, session_logs, memory_connections
       if (url.pathname === '/api/delete' && request.method === 'POST') {
-        const { table, entry_id } = await request.json() as any;
+        const { table, entry_id } = await readJson(request);
 
         const allowedTables = ['essence', 'people', 'core_memories', 'session_logs', 'memory_connections', 'patterns', 'sensory_memories', 'growth_markers', 'anticipation', 'inside_jokes', 'friction_log', 'reflections', 'drift_events', 'private_processing', 'rituals', 'unfinished_threads', 'fantasy_space', 'memory_anchors'];
         if (!allowedTables.includes(table)) {
@@ -5794,7 +5819,7 @@ export class CognitiveCore extends McpAgent<Env> {
       // === BRAIN VISUALIZATION GRAPH ===
       if (url.pathname === '/api/brain/graph' && request.method === 'POST') {
         try {
-          const { max_nodes = 80 } = await request.json() as any;
+          const { max_nodes = 80 } = await readJson(request);
           const perTable = Math.ceil(max_nodes / 7);
 
           const tables = Object.entries(tableMap);
@@ -5840,14 +5865,15 @@ export class CognitiveCore extends McpAgent<Env> {
 
           return jsonResponse({ nodes, links });
         } catch (error) {
-          return jsonResponse({ success: false, error: String(error) }, 500);
+          console.error('brain-graph query failed:', error);
+          return jsonResponse({ success: false, error: 'Internal error' }, 500);
         }
       }
 
       // === SKILLS REST ENDPOINTS ===
 
       if (url.pathname === '/api/skill/store' && request.method === 'POST') {
-        const { skill_name, description, approach, trigger_context, tags, source } = await request.json() as any;
+        const { skill_name, description, approach, trigger_context, tags, source } = await readJson(request);
 
         const embeddingText = `${skill_name}: ${description}. ${trigger_context || ''}`;
         const embedding = await generateEmbedding(embeddingText, env.HF_API_TOKEN, env.AI);
@@ -5867,7 +5893,7 @@ export class CognitiveCore extends McpAgent<Env> {
       }
 
       if (url.pathname === '/api/skill/recall' && request.method === 'POST') {
-        const { tag, min_effectiveness, limit = 10 } = await request.json() as any;
+        const { tag, min_effectiveness, limit = 10 } = await readJson(request);
         const options: any = { select: '*', order: 'effectiveness.desc,times_used.desc', limit };
         if (min_effectiveness !== undefined) options.gte = { effectiveness: min_effectiveness };
         const skills = await supabase.query('skills', options);
@@ -5877,7 +5903,7 @@ export class CognitiveCore extends McpAgent<Env> {
       }
 
       if (url.pathname === '/api/skill/outcome' && request.method === 'POST') {
-        const { skill_id, was_successful } = await request.json() as any;
+        const { skill_id, was_successful } = await readJson(request);
         const existing = await supabase.query('skills', { select: '*', filter: { id: skill_id }, limit: 1 });
         const skills = Array.isArray(existing) ? existing : [];
         if (skills.length === 0) return jsonResponse({ error: 'Skill not found' }, 404);
@@ -5922,5 +5948,12 @@ export class CognitiveCore extends McpAgent<Env> {
       return new Response('CogCor — Cognitive Core MCP Server', {
         headers: { 'Content-Type': 'text/plain' }
       });
+     } catch (err) {
+       if (err instanceof JsonParseError) {
+         return jsonResponse({ error: 'Invalid or empty JSON body' }, 400);
+       }
+       console.error('Unhandled error in fetch:', err);
+       return jsonResponse({ error: 'Internal error' }, 500);
+     }
     },
   };
