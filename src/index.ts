@@ -97,7 +97,10 @@ function createSupabaseClient(env: Env) {
         }
       }
       if (options.order) params.append('order', options.order);
-      if (options.limit) params.append('limit', options.limit.toString());
+      // Clamp caller-supplied limit (1..200) so a malformed/malicious client can't
+      // request an unbounded result set and exhaust Supabase egress. Most of the ~30
+      // list endpoints funnel their `limit` through here.
+      if (options.limit) params.append('limit', Math.min(Math.max(1, Number(options.limit) || 10), 200).toString());
 
       const queryString = params.toString();
       if (queryString) endpoint += `?${queryString}`;
@@ -263,7 +266,7 @@ function createSupabaseClient(env: Env) {
         body: JSON.stringify({
           query_embedding: `[${queryEmbedding.join(',')}]`,
           match_threshold: threshold,
-          match_count: limit,
+          match_count: Math.min(Math.max(1, Number(limit) || 10), 200),
           memory_type_filter: memoryType || null
         })
       });
@@ -1798,7 +1801,7 @@ export class CognitiveCore extends McpAgent<Env> {
       "update_private_thought",
       "Update a private thought's status or add insight gained from processing",
       {
-        id: z.string().describe("UUID of the private thought"),
+        id: z.string().uuid().describe("UUID of the private thought"),
         processing_status: z.enum(['active', 'integrated', 'released']).optional().describe("New status"),
         insight_gained: z.string().optional().describe("Insight gained from processing this thought")
       },
@@ -1808,18 +1811,9 @@ export class CognitiveCore extends McpAgent<Env> {
         if (processing_status) updates.processing_status = processing_status;
         if (insight_gained) updates.insight_gained = insight_gained;
 
-        const url = `${this.env.SUPABASE_URL}/rest/v1/private_processing?id=eq.${id}`;
-        const response = await fetch(url, {
-          method: 'PATCH',
-          headers: {
-            'apikey': this.env.SUPABASE_SERVICE_KEY,
-            'Authorization': `Bearer ${this.env.SUPABASE_SERVICE_KEY}`,
-            'Content-Type': 'application/json',
-            'Prefer': 'return=representation'
-          },
-          body: JSON.stringify(updates)
-        });
-        const result = await response.json();
+        // Route through the safe update() helper: it encodes the filter value
+        // (no PostgREST filter injection via `id`) and throws on failure.
+        await supabase.update('private_processing', updates, { id });
         return {
           content: [{ type: "text" as const, text: `Private thought updated: ${JSON.stringify(updates)}` }]
         };
@@ -1981,23 +1975,16 @@ export class CognitiveCore extends McpAgent<Env> {
       "resolve_thread",
       "Mark an unfinished thread as resolved",
       {
-        id: z.string().describe("UUID of the thread to resolve")
+        id: z.string().uuid().describe("UUID of the thread to resolve")
       },
       async ({ id }) => {
         const supabase = createSupabaseClient(this.env);
-        const url = `${this.env.SUPABASE_URL}/rest/v1/unfinished_threads?id=eq.${id}`;
-        await fetch(url, {
-          method: 'PATCH',
-          headers: {
-            'apikey': this.env.SUPABASE_SERVICE_KEY,
-            'Authorization': `Bearer ${this.env.SUPABASE_SERVICE_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            resolved: true,
-            resolved_at: new Date().toISOString()
-          })
-        });
+        // Route through the safe update() helper: encodes the filter value
+        // (no PostgREST filter injection via `id`) and throws on failure.
+        await supabase.update('unfinished_threads', {
+          resolved: true,
+          resolved_at: new Date().toISOString()
+        }, { id });
         return {
           content: [{ type: "text" as const, text: `Thread ${id} resolved` }]
         };
