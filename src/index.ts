@@ -801,6 +801,10 @@ export class CognitiveCore extends McpAgent<Env> {
 
         const url = this.env.SUPABASE_URL;
         const key = this.env.SUPABASE_SERVICE_KEY;
+        // Graph expansion below queries via this client — without it, `supabase`
+        // is undefined (TS2304) and every graph hop throws into the try/catch,
+        // so graph expansion silently contributes nothing. (found by Ves & Kaja)
+        const supabase = createSupabaseClient(this.env);
 
         const searchMemories = async (threshold: number, count: number, typeFilter?: string) => {
           const response = await fetch(`${url}/rest/v1/rpc/semantic_search_memories`, {
