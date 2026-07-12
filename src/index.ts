@@ -113,6 +113,13 @@ function createSupabaseClient(env: Env) {
         }
       });
 
+      // Fail loud: a 401/RLS/500 error body is NOT "no results". Without this,
+      // the error object flows back as if it were data — recall reports "nothing
+      // found" and existence checks (e.g. emotional_state upsert) mis-branch.
+      if (!response.ok) {
+        const body = await response.text().catch(() => '');
+        throw new Error(`query ${table} failed: ${response.status} — ${body.slice(0, 200)}`);
+      }
       const data = await response.json();
       // Strip embedding arrays and dead metadata to reduce token usage
       if (options.includeRaw !== true && Array.isArray(data)) {
@@ -252,6 +259,12 @@ function createSupabaseClient(env: Env) {
         }
       });
 
+      // Fail loud on delete errors too — a silent RLS denial here reads as
+      // "deleted ✓" while the row is still there.
+      if (!response.ok) {
+        const body = await response.text().catch(() => '');
+        throw new Error(`delete from ${table} failed: ${response.status} — ${body.slice(0, 200)}`);
+      }
       return response.json();
     },
 
@@ -270,6 +283,11 @@ function createSupabaseClient(env: Env) {
           memory_type_filter: memoryType || null
         })
       });
+      // Fail loud: an RPC error must not masquerade as an empty result set.
+      if (!response.ok) {
+        const body = await response.text().catch(() => '');
+        throw new Error(`semantic_search failed: ${response.status} — ${body.slice(0, 200)}`);
+      }
       return response.json();
     }
   };
