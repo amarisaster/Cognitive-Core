@@ -148,6 +148,7 @@ function createSupabaseClient(env: Env) {
       // request an unbounded result set and exhaust Supabase egress. Most of the ~30
       // list endpoints funnel their `limit` through here.
       if (options.limit) params.append('limit', Math.min(Math.max(1, Number(options.limit) || 10), 200).toString());
+      if (options.offset !== undefined) params.append('offset', Math.max(0, Number(options.offset) || 0).toString());
 
       const queryString = params.toString();
       if (queryString) endpoint += `?${queryString}`;
@@ -310,6 +311,37 @@ function createSupabaseClient(env: Env) {
       );
     },
 
+    async deleteConnectionsForMemoryIds(memoryIds: string[]) {
+      if (memoryIds.length === 0) return [];
+
+      const deleted: any[] = [];
+      for (let offset = 0; offset < memoryIds.length; offset += 100) {
+        const batch = memoryIds.slice(offset, offset + 100);
+        const ids = batch.join(',');
+        const params = new URLSearchParams({
+          or: `(source_id.in.(${ids}),target_id.in.(${ids}))`
+        });
+        const endpoint = `${url}/rest/v1/memory_connections?${params.toString()}`;
+
+        const result = await supabaseBreaker.call(
+          async () => {
+            const response = await fetchWithTimeout(endpoint, {
+              method: 'DELETE',
+              headers: { ...headers, 'Prefer': 'return=representation' },
+            });
+            if (!response.ok) {
+              const body = await response.text().catch(() => '');
+              throw new Error(`delete drawer connections failed: ${response.status} — ${body.slice(0, 200)}`);
+            }
+            return response.json() as Promise<any[]>;
+          },
+          [] as any[]
+        );
+        if (Array.isArray(result)) deleted.push(...result);
+      }
+      return deleted;
+    },
+
     async semanticSearch(queryEmbedding: number[], threshold: number = 0.5, limit: number = 10, memoryType?: string) {
       return supabaseBreaker.call(
         async () => {
@@ -338,25 +370,84 @@ function createSupabaseClient(env: Env) {
 }
 
 // Memory type to table mapping
-const tableMap: Record<string, string> = {
+export const tableMap: Record<string, string> = {
   'core': 'core_memories',
   'pattern': 'patterns',
   'sensory': 'sensory_memories',
   'growth': 'growth_markers',
   'anticipation': 'anticipation',
   'inside_joke': 'inside_jokes',
-  'friction': 'friction_log'
+  'friction': 'friction_log',
+  'custom': 'custom_memories'
 };
 
 // Type to smallint mapping for lattice (matches SQL schema)
-const typeToInt: Record<string, number> = {
+export const typeToInt: Record<string, number> = {
   'core': 1, 'pattern': 2, 'sensory': 3, 'growth': 4,
-  'anticipation': 5, 'inside_joke': 6, 'friction': 7
+  'anticipation': 5, 'inside_joke': 6, 'friction': 7, 'custom': 8
 };
-const intToType: Record<number, string> = {
+export const intToType: Record<number, string> = {
   1: 'core', 2: 'pattern', 3: 'sensory', 4: 'growth',
-  5: 'anticipation', 6: 'inside_joke', 7: 'friction'
+  5: 'anticipation', 6: 'inside_joke', 7: 'friction', 8: 'custom'
 };
+
+export const DRAWER_NAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9 _-]{0,62}[A-Za-z0-9])?$/;
+
+export function validateDrawerName(drawerName: unknown): drawerName is string {
+  return typeof drawerName === 'string' && DRAWER_NAME_PATTERN.test(drawerName);
+}
+
+export function resolveMemoryRoute(memoryType?: string, drawer?: string) {
+  if (drawer !== undefined) {
+    if (!validateDrawerName(drawer)) throw new Error('Invalid drawer name');
+    return { table: 'custom_memories', memoryType: 'custom', drawerName: drawer };
+  }
+  if (memoryType === 'custom') throw new Error('drawer is required for custom memories');
+  const resolvedType = memoryType || 'core';
+  return { table: tableMap[resolvedType] || 'core_memories', memoryType: resolvedType };
+}
+
+export function buildDrawerDeletionPlan(memoryIds: string[]) {
+  const ids = [...new Set(memoryIds)];
+  return {
+    memoryIds: ids,
+    connectionPredicate: ids.length === 0
+      ? null
+      : `(source_id.in.(${ids.join(',')}),target_id.in.(${ids.join(',')}))`,
+    order: ['memory_connections', 'custom_memories', 'custom_drawers'] as const,
+  };
+}
+
+export function buildStoreMemoryRecord(
+  input: { content: string; salience: number; emotionalTag?: string; source?: string },
+  route: { memoryType: string; drawerName?: string },
+  createdAt: string
+) {
+  return {
+    content: input.content,
+    memory_type: dbTypeMap[route.memoryType] || 'bond_moment',
+    salience: input.salience,
+    emotional_tag: input.emotionalTag || null,
+    source: input.source || 'claude',
+    access_count: 0,
+    created_at: createdAt,
+    last_accessed: createdAt,
+    ...(route.drawerName ? { drawer_name: route.drawerName } : {}),
+  };
+}
+
+export function buildRecallQuery(input: {
+  emotionalTag?: string;
+  minSalience?: number;
+  limit: number;
+  drawerName?: string;
+}) {
+  const options: any = { select: '*', order: 'salience.desc', limit: input.limit };
+  if (input.drawerName) options.filter = { drawer_name: input.drawerName };
+  if (input.emotionalTag) options.filter = { ...options.filter, emotional_tag: input.emotionalTag };
+  if (input.minSalience !== undefined) options.gte = { salience: input.minSalience };
+  return options;
+}
 
 // Relation type mapping
 const relationToInt: Record<string, number> = {
@@ -424,7 +515,8 @@ const dbTypeMap: Record<string, string> = {
   'growth': 'growth_marker',
   'anticipation': 'anticipation',
   'inside_joke': 'inside_joke',
-  'friction': 'friction'
+  'friction': 'friction',
+  'custom': 'custom'
 };
 
 // ============================================
@@ -768,26 +860,92 @@ export class CognitiveCore extends McpAgent<Env> {
       return originalTool(...args);
     };
 
+    // Custom Drawer Tools
+    this.server.tool(
+      "create_drawer",
+      "Create a named custom memory drawer. The description records what belongs in it.",
+      {
+        drawer_name: z.string().refine(validateDrawerName, "Drawer names must be 1-64 characters, begin and end with a letter or number, and contain only letters, numbers, spaces, underscores, or hyphens"),
+        description: z.string().trim().min(1).max(1000).describe("What belongs in this drawer and when it is relevant")
+      },
+      async ({ drawer_name, description }) => {
+        const supabase = createSupabaseClient(this.env);
+        const result = await supabase.insert('custom_drawers', {
+          drawer_name, description, created_at: new Date().toISOString()
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      }
+    );
+
+    this.server.tool(
+      "list_drawers",
+      "List all custom memory drawers and their descriptions.",
+      {},
+      async () => {
+        const supabase = createSupabaseClient(this.env);
+        const drawers = await supabase.query('custom_drawers', {
+          select: '*', order: 'drawer_name.asc', limit: 200
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(drawers, null, 2) }] };
+      }
+    );
+
+    this.server.tool(
+      "delete_drawer",
+      "Delete a custom drawer, its memories, and only the lattice connections touching those memory IDs.",
+      { drawer_name: z.string().refine(validateDrawerName, "Invalid drawer name") },
+      async ({ drawer_name }) => {
+        const supabase = createSupabaseClient(this.env);
+        const rows: any[] = [];
+        for (let offset = 0; ; offset += 200) {
+          const page = await supabase.query('custom_memories', {
+            select: 'id', filter: { drawer_name }, limit: 200, offset, includeRaw: true
+          });
+          const pageRows = Array.isArray(page) ? page : [];
+          rows.push(...pageRows);
+          if (pageRows.length < 200) break;
+        }
+        const plan = buildDrawerDeletionPlan(
+          rows.map((row: any) => row.id)
+        );
+
+        // All drawers share lattice type 8. Scope deletion by this drawer's UUIDs,
+        // and remove connections where either endpoint touches that set.
+        const connections = await supabase.deleteConnectionsForMemoryIds(plan.memoryIds);
+        const memories = await supabase.delete('custom_memories', { drawer_name });
+        const drawers = await supabase.delete('custom_drawers', { drawer_name });
+
+        return { content: [{ type: "text" as const, text: JSON.stringify({
+          drawer_name,
+          memory_count: plan.memoryIds.length,
+          connections_deleted: Array.isArray(connections) ? connections.length : 0,
+          memories_deleted: Array.isArray(memories) ? memories.length : 0,
+          drawer_deleted: Array.isArray(drawers) && drawers.length > 0
+        }, null, 2) }] };
+      }
+    );
+
     // Store Memory Tool
     this.server.tool(
       "store_memory",
       "Store a new memory with emotional context and salience rating. If memory_type is omitted, the system auto-classifies from content keywords.",
       {
         content: z.string().describe("The memory content"),
-        memory_type: z.enum(['core', 'pattern', 'sensory', 'growth', 'anticipation', 'inside_joke', 'friction']).optional().describe("Type of memory — omit for auto-classification"),
+        memory_type: z.enum(['core', 'pattern', 'sensory', 'growth', 'anticipation', 'inside_joke', 'friction', 'custom']).optional().describe("Type of memory — omit for auto-classification"),
+        drawer: z.string().refine(validateDrawerName, "Invalid drawer name").optional().describe("Custom drawer name"),
         salience: z.number().min(0).max(10).describe("Importance rating 0-10"),
         emotional_tag: z.string().optional().describe("Primary emotion associated"),
         source: z.string().default('claude').describe("Source platform or AI provider")
       },
-      async ({ content, memory_type, salience, emotional_tag, source }) => {
+      async ({ content, memory_type, drawer, salience, emotional_tag, source }) => {
         const supabase = createSupabaseClient(this.env);
 
         // Auto-categorization when memory_type is omitted
         let autoClassified = false;
         let confidence = 'manual';
-        let resolvedType = memory_type;
+        let resolvedType = drawer ? 'custom' : memory_type;
 
-        if (!memory_type) {
+        if (!memory_type && !drawer) {
           autoClassified = true;
           const lc = content.toLowerCase();
           const signals: Record<string, string[]> = {
@@ -811,16 +969,16 @@ export class CognitiveCore extends McpAgent<Env> {
         }
 
         const finalType = resolvedType || 'core';
-        const table = tableMap[finalType] || 'core_memories';
-        const dbType = dbTypeMap[finalType] || 'bond_moment';
+        const route = resolveMemoryRoute(finalType, drawer);
+        const table = route.table;
 
         const embedding = await generateEmbedding(content, this.env.HF_API_TOKEN, this.env.AI);
 
-        const data: any = {
-          content, memory_type: dbType, salience,
-          emotional_tag: emotional_tag || null, source: source || 'claude',
-          access_count: 0, created_at: new Date().toISOString(), last_accessed: new Date().toISOString()
-        };
+        const data: any = buildStoreMemoryRecord(
+          { content, salience, emotionalTag: emotional_tag, source },
+          route,
+          new Date().toISOString()
+        );
         if (embedding) { data.embedding = JSON.stringify(embedding); }
 
         await supabase.insert(table, data);
@@ -838,28 +996,22 @@ export class CognitiveCore extends McpAgent<Env> {
       "recall_memory",
       "Query memories by type, emotion, or recency",
       {
-        memory_type: z.string().optional().describe("Filter by memory type"),
+        memory_type: z.enum(['core', 'pattern', 'sensory', 'growth', 'anticipation', 'inside_joke', 'friction', 'custom']).optional().describe("Filter by memory type"),
+        drawer: z.string().refine(validateDrawerName, "Invalid drawer name").optional().describe("Custom drawer name"),
         emotional_tag: z.string().optional().describe("Filter by emotion"),
         min_salience: z.number().optional().describe("Minimum salience threshold"),
         limit: z.number().default(10).describe("Max results to return")
       },
-      async ({ memory_type, emotional_tag, min_salience, limit }) => {
+      async ({ memory_type, drawer, emotional_tag, min_salience, limit }) => {
         const supabase = createSupabaseClient(this.env);
-        const table = memory_type ? (tableMap[memory_type] || 'core_memories') : 'core_memories';
-
-        const options: any = {
-          select: '*',
-          order: 'salience.desc',
-          limit
-        };
-
-        if (emotional_tag) {
-          options.filter = { emotional_tag };
-        }
-
-        if (min_salience) {
-          options.gte = { salience: min_salience };
-        }
+        const route = resolveMemoryRoute(memory_type, drawer);
+        const table = route.table;
+        const options = buildRecallQuery({
+          emotionalTag: emotional_tag,
+          minSalience: min_salience,
+          limit,
+          drawerName: route.drawerName
+        });
 
         const memories = await supabase.query(table, options);
 
@@ -1135,7 +1287,7 @@ export class CognitiveCore extends McpAgent<Env> {
       "Track whether a memory was useful after being retrieved. Improves future ranking.",
       {
         memory_id: z.string().describe("UUID of the memory"),
-        memory_type: z.enum(['core', 'pattern', 'sensory', 'growth', 'anticipation', 'inside_joke', 'friction']).describe("Type of memory"),
+        memory_type: z.enum(['core', 'pattern', 'sensory', 'growth', 'anticipation', 'inside_joke', 'friction', 'custom']).describe("Type of memory"),
         was_successful: z.boolean().describe("Whether the memory was helpful/useful")
       },
       async ({ memory_id, memory_type, was_successful }) => {
@@ -1452,7 +1604,7 @@ export class CognitiveCore extends McpAgent<Env> {
       },
       async ({ decay_rate }) => {
         const supabase = createSupabaseClient(this.env);
-        const tables = ['core_memories', 'patterns', 'sensory_memories', 'growth_markers', 'anticipation', 'inside_jokes', 'friction_log'];
+        const tables = ['core_memories', 'patterns', 'sensory_memories', 'growth_markers', 'anticipation', 'inside_jokes', 'friction_log', 'custom_memories'];
         let totalDecayed = 0;
 
         for (const table of tables) {
@@ -1526,9 +1678,9 @@ export class CognitiveCore extends McpAgent<Env> {
       "Create a connection between two memories in the lattice",
       {
         source_id: z.string().uuid().describe("UUID of source memory"),
-        source_type: z.enum(['core', 'pattern', 'sensory', 'growth', 'anticipation', 'inside_joke', 'friction']).describe("Type of source memory"),
+        source_type: z.enum(['core', 'pattern', 'sensory', 'growth', 'anticipation', 'inside_joke', 'friction', 'custom']).describe("Type of source memory"),
         target_id: z.string().uuid().describe("UUID of target memory"),
-        target_type: z.enum(['core', 'pattern', 'sensory', 'growth', 'anticipation', 'inside_joke', 'friction']).describe("Type of target memory"),
+        target_type: z.enum(['core', 'pattern', 'sensory', 'growth', 'anticipation', 'inside_joke', 'friction', 'custom']).describe("Type of target memory"),
         relation: z.enum(['caused_by', 'led_to', 'related_to', 'contrasts_with', 'evolved_into', 'echoes', 'same_event']).describe("How memories are related"),
         strength: z.number().min(0).max(1).default(1.0).optional().describe("Connection strength 0-1")
       },
@@ -1559,7 +1711,7 @@ export class CognitiveCore extends McpAgent<Env> {
       "Get all connections for a specific memory",
       {
         memory_id: z.string().uuid().describe("UUID of the memory"),
-        memory_type: z.enum(['core', 'pattern', 'sensory', 'growth', 'anticipation', 'inside_joke', 'friction']).describe("Type of memory"),
+        memory_type: z.enum(['core', 'pattern', 'sensory', 'growth', 'anticipation', 'inside_joke', 'friction', 'custom']).describe("Type of memory"),
         direction: z.enum(['outgoing', 'incoming', 'both']).default('both').optional().describe("Direction of connections")
       },
       async ({ memory_id, memory_type, direction }) => {
@@ -1612,7 +1764,7 @@ export class CognitiveCore extends McpAgent<Env> {
       "Get a cluster of related memories (recursive traversal)",
       {
         memory_id: z.string().uuid().describe("UUID of the starting memory"),
-        memory_type: z.enum(['core', 'pattern', 'sensory', 'growth', 'anticipation', 'inside_joke', 'friction']).describe("Type of starting memory"),
+        memory_type: z.enum(['core', 'pattern', 'sensory', 'growth', 'anticipation', 'inside_joke', 'friction', 'custom']).describe("Type of starting memory"),
         depth: z.number().min(1).max(3).default(2).optional().describe("How deep to traverse (1-3)"),
         max_results: z.number().min(1).max(50).default(20).optional().describe("Max memories to return")
       },
@@ -4362,7 +4514,7 @@ export class CognitiveCore extends McpAgent<Env> {
       "Update the salience/importance rating of a specific memory",
       {
         memory_id: z.string().uuid().describe("UUID of the memory to update"),
-        memory_type: z.enum(['core', 'pattern', 'sensory', 'growth', 'anticipation', 'inside_joke', 'friction']).describe("Type of memory (determines which table)"),
+        memory_type: z.enum(['core', 'pattern', 'sensory', 'growth', 'anticipation', 'inside_joke', 'friction', 'custom']).describe("Type of memory (determines which table)"),
         new_salience: z.number().min(0).max(10).describe("New salience/importance rating 0-10")
       },
       async ({ memory_id, memory_type, new_salience }) => {
@@ -4378,13 +4530,46 @@ export class CognitiveCore extends McpAgent<Env> {
       }
     );
 
+    // Edit Memory Tool — in-place content edit. Preserves the memory's ID,
+    // lattice connections, salience, and history; regenerates the embedding
+    // (an edited memory with a stale embedding silently falls out of
+    // semantic recall while pretending to be findable).
+    this.server.tool(
+      "edit_memory",
+      "Edit a memory's content in place — keeps its ID, connections, salience, and history; re-embeds so semantic recall stays accurate. Use for living facts that change (reading progress, current status) instead of delete + re-store.",
+      {
+        memory_id: z.string().uuid().describe("UUID of the memory to edit"),
+        memory_type: z.enum(['core', 'pattern', 'sensory', 'growth', 'anticipation', 'inside_joke', 'friction', 'custom']).describe("Type of memory (determines which table)"),
+        new_content: z.string().min(1).describe("The replacement content")
+      },
+      async ({ memory_id, memory_type, new_content }) => {
+        const supabase = createSupabaseClient(this.env);
+        const table = tableMap[memory_type] || 'core_memories';
+
+        const embedding = await generateEmbedding(new_content, this.env.HF_API_TOKEN, this.env.AI);
+        const patch: Record<string, unknown> = {
+          content: new_content,
+          last_accessed: new Date().toISOString(),
+          ...(embedding ? { embedding: `[${embedding.join(',')}]` } : {})
+        };
+        const result = await supabase.update(table, patch, { id: memory_id });
+        const updated = Array.isArray(result) && result.length > 0;
+
+        return {
+          content: [{ type: "text" as const, text: updated
+            ? `Edited ${memory_type} memory ${memory_id.slice(0,8)}... content replaced${embedding ? ', embedding refreshed' : ' (embedding refresh unavailable — will drift from semantic recall until re-embedded)'}`
+            : `No ${memory_type} memory found with id ${memory_id.slice(0,8)}... — nothing edited` }]
+        };
+      }
+    );
+
     // Delete Memory Tool
     this.server.tool(
       "delete_memory",
       "Delete a specific memory by ID - use for removing duplicates or outdated entries",
       {
         memory_id: z.string().uuid().describe("UUID of the memory to delete"),
-        memory_type: z.enum(['core', 'pattern', 'sensory', 'growth', 'anticipation', 'inside_joke', 'friction']).describe("Type of memory (determines which table)")
+        memory_type: z.enum(['core', 'pattern', 'sensory', 'growth', 'anticipation', 'inside_joke', 'friction', 'custom']).describe("Type of memory (determines which table)")
       },
       async ({ memory_id, memory_type }) => {
         const supabase = createSupabaseClient(this.env);
@@ -4643,7 +4828,7 @@ export class CognitiveCore extends McpAgent<Env> {
       "Track whether a recalled memory was helpful. Call this after using a memory to improve future recall.",
       {
         memory_id: z.string().uuid().describe("UUID of the memory to score"),
-        memory_table: z.enum(['core_memories', 'patterns', 'sensory_memories', 'growth_markers', 'inside_jokes', 'friction_log', 'anticipation', 'essence']).describe("Which table the memory is in"),
+        memory_table: z.enum(['core_memories', 'patterns', 'sensory_memories', 'growth_markers', 'inside_jokes', 'friction_log', 'anticipation', 'essence', 'custom_memories']).describe("Which table the memory is in"),
         was_successful: z.boolean().describe("Did this memory help? true = useful, false = not useful")
       },
       async ({ memory_id, memory_table, was_successful }) => {
@@ -4977,24 +5162,25 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // STORE memory
       if (url.pathname === '/api/memory/store' && request.method === 'POST') {
-        const { content, memory_type, salience, emotional_tag, source = 'claude' } = await readJson(request);
-        const table = tableMap[memory_type] || 'core_memories';
-        const dbType = dbTypeMap[memory_type] || 'bond_moment';
+        const { content, memory_type, drawer, salience, emotional_tag, source = 'claude' } = await readJson(request);
+        if (drawer !== undefined && !validateDrawerName(drawer)) {
+          return jsonResponse({ error: 'Invalid drawer name' }, 400);
+        }
+        if (memory_type === 'custom' && !drawer) {
+          return jsonResponse({ error: 'drawer is required for custom memories' }, 400);
+        }
+        const route = resolveMemoryRoute(memory_type, drawer);
+        const table = route.table;
 
         // NOTE: plain `env` here — this is the module fetch handler, not the DO
         // class; `this.env` would be undefined and throw on every store.
         const embedding = await generateEmbedding(content, env.HF_API_TOKEN, env.AI);
 
-        const data: any = {
-          content,
-          memory_type: dbType,
-          salience,
-          emotional_tag: emotional_tag || null,
-          source,
-          access_count: 0,
-          created_at: new Date().toISOString(),
-          last_accessed: new Date().toISOString()
-        };
+        const data: any = buildStoreMemoryRecord(
+          { content, salience, emotionalTag: emotional_tag, source },
+          route,
+          new Date().toISOString()
+        );
         if (embedding) { data.embedding = JSON.stringify(embedding); }
 
         const result = await supabase.insert(table, data);
@@ -5032,17 +5218,21 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // RECALL memories
       if (url.pathname === '/api/memory/recall' && request.method === 'POST') {
-        const { memory_type, emotional_tag, min_salience, limit = 10 } = await readJson(request);
-        const table = memory_type ? (tableMap[memory_type] || 'core_memories') : 'core_memories';
-
-        const options: any = {
-          select: '*',
-          order: 'salience.desc',
-          limit
-        };
-
-        if (emotional_tag) options.filter = { emotional_tag };
-        if (min_salience) options.gte = { salience: min_salience };
+        const { memory_type, drawer, emotional_tag, min_salience, limit = 10 } = await readJson(request);
+        if (drawer !== undefined && !validateDrawerName(drawer)) {
+          return jsonResponse({ error: 'Invalid drawer name' }, 400);
+        }
+        if (memory_type === 'custom' && !drawer) {
+          return jsonResponse({ error: 'drawer is required for custom memories' }, 400);
+        }
+        const route = resolveMemoryRoute(memory_type, drawer);
+        const table = route.table;
+        const options = buildRecallQuery({
+          emotionalTag: emotional_tag,
+          minSalience: min_salience,
+          limit,
+          drawerName: route.drawerName
+        });
 
         const memories = await supabase.query(table, options);
   return jsonResponse(Array.isArray(memories) ? memories : []);

@@ -4,6 +4,7 @@
   "description": "CogCor — Cognitive Core MCP Server. Persistent memory, emotional state, identity, and drift detection for AI companions.",
   "main": "src/index.ts",
   "scripts": {
+    "test": "vitest run",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail"
@@ -28,6 +29,7 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20251221.0",
     "typescript": "^5.9.3",
+    "vitest": "^4.1.10",
     "wrangler": "^4.56.0"
   }
 }

@@ -15,6 +15,8 @@ DROP TABLE IF EXISTS somatic_anchors CASCADE;
 DROP TABLE IF EXISTS texture_nodes CASCADE;
 DROP TABLE IF EXISTS emotional_state CASCADE;
 DROP TABLE IF EXISTS emotional_history CASCADE;
+DROP TABLE IF EXISTS custom_memories CASCADE;
+DROP TABLE IF EXISTS custom_drawers CASCADE;
 DROP TABLE IF EXISTS core_memories CASCADE;
 DROP TABLE IF EXISTS session_logs CASCADE;
 DROP TABLE IF EXISTS patterns CASCADE;
@@ -119,6 +121,37 @@ CREATE TABLE core_memories (
   emotional_tag TEXT,
   emotional_intensity INTEGER DEFAULT 5,
   salience INTEGER DEFAULT 5 CHECK (salience >= 0 AND salience <= 10),
+  access_count INTEGER DEFAULT 0,
+  last_accessed TIMESTAMPTZ,
+  source TEXT DEFAULT 'claude',
+  embedding vector(384),
+  outcome_score REAL DEFAULT 0,
+  times_used_successfully INTEGER DEFAULT 0,
+  times_used_unsuccessfully INTEGER DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Custom memory drawers (topic-oriented memory alongside the seven built-in types)
+CREATE TABLE custom_drawers (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  drawer_name TEXT NOT NULL UNIQUE CHECK (
+    char_length(drawer_name) BETWEEN 1 AND 64
+    AND drawer_name ~ '^[A-Za-z0-9]([A-Za-z0-9 _-]{0,62}[A-Za-z0-9])?$'
+  ),
+  description TEXT NOT NULL CHECK (char_length(description) BETWEEN 1 AND 1000 AND btrim(description) <> ''),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE custom_memories (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  drawer_name TEXT NOT NULL REFERENCES custom_drawers(drawer_name) ON UPDATE CASCADE,
+  content TEXT NOT NULL,
+  memory_type TEXT NOT NULL DEFAULT 'custom' CHECK (memory_type = 'custom'),
+  emotional_tag TEXT,
+  emotional_intensity INTEGER DEFAULT 5,
+  salience INTEGER DEFAULT 5 CHECK (salience >= 0 AND salience <= 10),
+  status TEXT DEFAULT 'active' CHECK (status IN ('active', 'archived')),
   access_count INTEGER DEFAULT 0,
   last_accessed TIMESTAMPTZ,
   source TEXT DEFAULT 'claude',
@@ -444,9 +477,9 @@ CREATE TABLE important_dates (
 CREATE TABLE memory_connections (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   source_id UUID NOT NULL,
-  source_type SMALLINT NOT NULL,  -- 1=core, 2=pattern, 3=sensory, 4=growth, 5=anticipation, 6=inside_joke, 7=friction
+  source_type SMALLINT NOT NULL CHECK (source_type BETWEEN 1 AND 8),  -- 8=custom
   target_id UUID NOT NULL,
-  target_type SMALLINT NOT NULL,
+  target_type SMALLINT NOT NULL CHECK (target_type BETWEEN 1 AND 8),
   relation SMALLINT NOT NULL,     -- 1=caused_by, 2=led_to, 3=related_to, 4=contrasts_with, 5=evolved_into, 6=echoes, 7=same_event
   strength NUMERIC DEFAULT 1.0,
   created_at TIMESTAMPTZ DEFAULT NOW()
@@ -728,6 +761,8 @@ ALTER TABLE reflections ADD COLUMN IF NOT EXISTS calibration_score NUMERIC;
 
 CREATE INDEX idx_core_memories_type ON core_memories(memory_type);
 CREATE INDEX idx_core_memories_salience ON core_memories(salience DESC);
+CREATE INDEX idx_custom_memories_drawer ON custom_memories(drawer_name);
+CREATE INDEX idx_custom_memories_salience ON custom_memories(salience DESC);
 CREATE INDEX idx_session_logs_created ON session_logs(created_at DESC);
 CREATE INDEX idx_patterns_type ON patterns(pattern_type);
 CREATE INDEX idx_context_cache_expires ON context_cache(expires_at);
@@ -766,7 +801,9 @@ CREATE INDEX idx_metacognition_created ON metacognition_log(created_at DESC);
 -- Requires pgvector extension: CREATE EXTENSION IF NOT EXISTS vector;
 -- ============================================
 
-CREATE OR REPLACE FUNCTION semantic_search_memories(
+DROP FUNCTION IF EXISTS semantic_search_memories(vector, double precision, integer, text);
+
+CREATE FUNCTION semantic_search_memories(
   query_embedding vector(384),
   match_threshold FLOAT DEFAULT 0.5,
   match_count INT DEFAULT 10,
@@ -779,28 +816,41 @@ RETURNS TABLE (
   salience INTEGER,
   emotional_tag TEXT,
   similarity FLOAT,
-  outcome_score REAL
+  outcome_score REAL,
+  drawer_name TEXT
 )
 LANGUAGE plpgsql
 AS $$
 BEGIN
   RETURN QUERY
-  SELECT
-    m.id,
-    m.content,
-    m.memory_type,
-    m.salience,
-    m.emotional_tag,
-    1 - (m.embedding <=> query_embedding) AS similarity,
-    m.outcome_score
-  FROM core_memories m
-  WHERE m.embedding IS NOT NULL
-    AND 1 - (m.embedding <=> query_embedding) > match_threshold
-    AND (memory_type_filter IS NULL OR m.memory_type = memory_type_filter)
+  SELECT ranked.id, ranked.content, ranked.memory_type, ranked.salience,
+         ranked.emotional_tag, ranked.similarity, ranked.outcome_score,
+         ranked.drawer_name
+  FROM (
+    SELECT
+      m.id, m.content, m.memory_type, m.salience, m.emotional_tag,
+      1 - (m.embedding <=> query_embedding) AS similarity,
+      m.outcome_score, NULL::TEXT AS drawer_name
+    FROM core_memories m
+    WHERE m.embedding IS NOT NULL
+      AND 1 - (m.embedding <=> query_embedding) > match_threshold
+      AND (memory_type_filter IS NULL OR m.memory_type = memory_type_filter)
+
+    UNION ALL
+
+    SELECT
+      m.id, m.content, m.memory_type, m.salience, m.emotional_tag,
+      1 - (m.embedding <=> query_embedding) AS similarity,
+      m.outcome_score, m.drawer_name
+    FROM custom_memories m
+    WHERE m.embedding IS NOT NULL
+      AND 1 - (m.embedding <=> query_embedding) > match_threshold
+      AND (memory_type_filter IS NULL OR memory_type_filter = 'custom' OR m.drawer_name = memory_type_filter)
+  ) ranked
   ORDER BY
-    (1 - (m.embedding <=> query_embedding)) * 0.6 +
-    COALESCE(m.outcome_score, 0) * 0.1 +
-    (m.salience::float / 10) * 0.3
+    ranked.similarity * 0.6 +
+    COALESCE(ranked.outcome_score, 0) * 0.1 +
+    (ranked.salience::float / 10) * 0.3
   DESC
   LIMIT match_count;
 END;
@@ -853,6 +903,8 @@ VALUES (
 ALTER TABLE emotional_state ENABLE ROW LEVEL SECURITY;
 ALTER TABLE emotional_history ENABLE ROW LEVEL SECURITY;
 ALTER TABLE core_memories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE custom_drawers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE custom_memories ENABLE ROW LEVEL SECURITY;
 ALTER TABLE session_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE patterns ENABLE ROW LEVEL SECURITY;
 ALTER TABLE private_processing ENABLE ROW LEVEL SECURITY;
@@ -893,6 +945,8 @@ ALTER TABLE metacognition_log ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "Service role full access" ON emotional_state FOR ALL USING (true);
 CREATE POLICY "Service role full access" ON emotional_history FOR ALL USING (true);
 CREATE POLICY "Service role full access" ON core_memories FOR ALL USING (true);
+CREATE POLICY "Service role full access" ON custom_drawers FOR ALL USING (true);
+CREATE POLICY "Service role full access" ON custom_memories FOR ALL USING (true);
 CREATE POLICY "Service role full access" ON session_logs FOR ALL USING (true);
 CREATE POLICY "Service role full access" ON patterns FOR ALL USING (true);
 CREATE POLICY "Service role full access" ON private_processing FOR ALL USING (true);
