@@ -56,7 +56,7 @@ async function generateEmbedding(text: string, hfToken: string, ai?: any): Promi
 }
 
 // Circuit breaker — trips after repeated failures, fails fast during cooldown
-class CircuitBreaker {
+export class CircuitBreaker {
   private failures = 0;
   private lastFailure = 0;
   private state: 'closed' | 'open' | 'half-open' = 'closed';
@@ -87,8 +87,16 @@ class CircuitBreaker {
       if (this.state === 'half-open') {
         console.log(`Circuit breaker [${this.name}] recovered`);
         this.state = 'closed';
-        this.failures = 0;
       }
+      // Reset on ANY success, not just recovery from half-open.
+      //
+      // Found by Kai and Lucian, 2026-08-18: this used to clear the counter only
+      // inside the half-open branch, so while closed the count only ever went up.
+      // Five failures scattered across hours — unrelated, with thousands of
+      // successes between them — would trip the breaker as if they had been
+      // consecutive. A threshold is meant to detect a service that is currently
+      // down, and that requires forgetting failures the service has since disproved.
+      this.failures = 0;
       return result;
     } catch (err) {
       this.failures++;
@@ -105,6 +113,83 @@ class CircuitBreaker {
 
 const supabaseBreaker = new CircuitBreaker('supabase', 5, 30000);
 const embeddingBreaker = new CircuitBreaker('embedding', 3, 60000);
+
+// Usage logging gets its OWN breaker, deliberately.
+//
+// Found by Kai and Lucian, 2026-08-18: usage_logs was written through the shared
+// supabase breaker on EVERY tool dispatch. A fork whose usage_logs table is missing
+// or lacks duration_ms therefore failed on every call, and after five the shared
+// breaker opened — so memory reads and writes died to protect telemetry nobody
+// reads. The .catch(() => {}) hid the cause, because the breaker had already
+// counted the failure before the error was swallowed.
+//
+// Isolating it means broken telemetry can only ever disable telemetry.
+const telemetryBreaker = new CircuitBreaker('telemetry', 3, 300000);
+
+/**
+ * Write a usage_logs row without ever putting memory access at risk.
+ *
+ * Goes direct rather than through supabase.insert() so it stays on the telemetry
+ * breaker. Never throws: callers are instrumentation, not features.
+ */
+async function writeUsageLog(env: Env, row: Record<string, unknown>): Promise<boolean> {
+  const url = env.SUPABASE_URL;
+  const key = env.SUPABASE_SERVICE_KEY;
+  if (!url || !key) return false;
+  return telemetryBreaker.call(
+    async () => {
+      const res = await fetchWithTimeout(`${url}/rest/v1/usage_logs`, {
+        method: 'POST',
+        headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', 'Prefer': 'return=minimal' },
+        body: JSON.stringify(row),
+      }, 5000);
+      if (!res.ok) {
+        // Counted by the telemetry breaker so a fork with a missing column stops
+        // retrying on every call, but never surfaced — and never escalated.
+        throw new Error(`usage_logs write failed: ${res.status}`);
+      }
+      return true;
+    },
+    false,
+    false,
+  );
+}
+
+/**
+ * Score a memory's outcome via the update_memory_outcome RPC.
+ *
+ * Existed in three copy-pasted places (the MCP tool, its duplicate, and the
+ * /api/memory/outcome route), none of which checked the response. A fork without
+ * the RPC installed got a 404 and was still told the score had been updated, so
+ * outcome tracking silently did nothing — and outcome feeds the delta term of
+ * recall ranking, so recall quietly stopped improving. One implementation now,
+ * on the breaker, with a timeout, that reports what happened.
+ * Found by Kai and Lucian, 2026-08-18.
+ */
+async function updateMemoryOutcome(
+  env: Env,
+  args: { memory_id: string; memory_table: string; was_successful: boolean },
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const url = env.SUPABASE_URL;
+  const key = env.SUPABASE_SERVICE_KEY;
+  try {
+    await supabaseBreaker.call(async () => {
+      const res = await fetchWithTimeout(`${url}/rest/v1/rpc/update_memory_outcome`, {
+        method: 'POST',
+        headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(args),
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error(`${res.status} — ${body.slice(0, 200)}`);
+      }
+      return true;
+    }, false);
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message || e).slice(0, 200) };
+  }
+}
 
 async function fetchWithTimeout(input: RequestInfo, init: RequestInit = {}, timeoutMs = 10000): Promise<Response> {
   const controller = new AbortController();
@@ -128,7 +213,13 @@ function createSupabaseClient(env: Env) {
   };
 
   return {
-    async query(table: string, options: any = {}) {
+    // Return type is explicit because inference collapsed it to `{}`: the breaker is
+    // `call<T>(fn, fallback)` and unified `response.json()` with the `[]` fallback down
+    // to the empty object type. Every caller then failed to .map/.length its own rows —
+    // 15 errors of one species, which is why this repo had no typecheck script and why
+    // `npx tsc --noEmit` was not a gate any fork could actually pass. Not `any[]`:
+    // includeRaw and non-array bodies return `data` unchanged. Found by Lucian, 2026-08-18.
+    async query(table: string, options: any = {}): Promise<any> {
       let endpoint = `${url}/rest/v1/${table}`;
       const params = new URLSearchParams();
 
@@ -141,6 +232,16 @@ function createSupabaseClient(env: Env) {
       if (options.gte) {
         for (const [k, value] of Object.entries(options.gte)) {
           params.append(k, `gte.${value}`);
+        }
+      }
+      // `isNull: { embedding: true }` was passed by the embedding backfill and
+      // silently ignored — the option had never been implemented. The backfill
+      // therefore read the first 50 rows of each table regardless of embedding
+      // state, re-embedded healthy ones, never reached the null ones, and reported
+      // success. Any unrecognised option here fails the same way, quietly.
+      if (options.isNull) {
+        for (const [k, value] of Object.entries(options.isNull)) {
+          params.append(k, value ? 'is.null' : 'not.is.null');
         }
       }
       if (options.order) params.append('order', options.order);
@@ -194,14 +295,6 @@ function createSupabaseClient(env: Env) {
       // inside_jokes) also have no `created_at` (they use date_noticed / first_used), so the
       // generic created_at bounces there too — strip it for those. Without this, six of seven
       // memory types silently fail their NOT NULL constraint on every write.
-      const primaryTextColumn: Record<string, string> = {
-        patterns: 'description',
-        sensory_memories: 'detail',
-        growth_markers: 'observation',
-        anticipation: 'what',
-        inside_jokes: 'reference',
-        friction_log: 'what_happened',
-      };
       const noCreatedAtColumn = new Set(['growth_markers', 'inside_jokes']);
       const primaryCol = primaryTextColumn[table];
       if (primaryCol || noCreatedAtColumn.has(table)) {
@@ -381,6 +474,31 @@ export const tableMap: Record<string, string> = {
   'custom': 'custom_memories'
 };
 
+/**
+ * Each memory table names its primary text column differently. Callers pass a
+ * generic `content`, so anything reading or writing memory text has to translate.
+ *
+ * Hoisted to module scope because it was inline in insert() while
+ * /api/admin/backfill-embeddings selected `id,content` from all seven tables —
+ * so six of them read null and would have embedded nothing. Same divergence Ves
+ * and Kaja found on the write path, resurfacing on the read path.
+ */
+export const primaryTextColumn: Record<string, string> = {
+  patterns: 'description',
+  sensory_memories: 'detail',
+  growth_markers: 'observation',
+  anticipation: 'what',
+  inside_jokes: 'reference',
+  friction_log: 'what_happened',
+};
+
+/** The text of a memory row, whichever column this table happens to keep it in. */
+export function memoryText(table: string, row: any): string | null {
+  const col = primaryTextColumn[table];
+  const value = (col ? row?.[col] : null) ?? row?.content ?? null;
+  return typeof value === 'string' && value.trim() ? value : null;
+}
+
 // Type to smallint mapping for lattice (matches SQL schema)
 export const typeToInt: Record<string, number> = {
   'core': 1, 'pattern': 2, 'sensory': 3, 'growth': 4,
@@ -526,7 +644,13 @@ function computeEdgeDecay(createdAt: string | null, halfLifeDays: number, persis
 function computeRecencyDecay(createdAt: string | null): number {
   if (!createdAt) return 0.5;
   const ageDays = (Date.now() - new Date(createdAt).getTime()) / 86400000;
-  return 1 / (1 + ageDays / 30);
+  if (!Number.isFinite(ageDays)) return 0.5;
+  // Clamp the age at zero. A future-dated row — clock skew between a client and
+  // Supabase is enough — gives a negative age, and 1/(1 + negative) climbs above 1,
+  // which breaks the 0..1 invariant every other term in the composite obeys and
+  // lets a row inflate its own rank by being wrong about when it happened.
+  // Nothing is "fresher than now", so the ceiling is 1.
+  return 1 / (1 + Math.max(0, ageDays) / 30);
 }
 
 function computeSomaticValence(anchor: any, intent: string): number {
@@ -554,7 +678,49 @@ function computeCompositeScore(
        + config.epsilon * somaticValence;
 }
 
+// The two relevance terms a candidate contributes, derived from the row itself.
+//
+// Extracted from the semantic_recall handler so it can be tested. It was inline,
+// which is precisely why the salience-aliased-as-similarity bug survived: the
+// scoring maths was always correct, the INPUT to it was not, and nothing that
+// derived that input ever ran under test.
+//
+// A graph-expanded row was never compared to the query vector, so it has no
+// vector similarity. Its relevance is entirely its graph proximity, and
+// _graph_score already carries the seed's similarity through edge strength and
+// decay. Direct-search rows have the reverse shape: real similarity, and full
+// proximity because they need no hops to reach.
+export function deriveRelevance(row: any): { vectorSim: number; graphProximity: number } {
+  if (row?._pool === 'graph') {
+    return { vectorSim: 0, graphProximity: row._graph_score || 0 };
+  }
+  return { vectorSim: row?.similarity || row?.combined_score || 0, graphProximity: 1.0 };
+}
+
+export { computeCompositeScore, INTENT_CONFIG };
+
 // Map input types to valid database memory_type values
+/**
+ * Routing type -> the DEFAULT value of the row's own `memory_type` column.
+ *
+ * These are two different axes, and conflating them is why `core` vs `bond_moment`
+ * reads like a contradiction (raised by Kai, 2026-08-18):
+ *
+ *   - The ROUTING type — 'core', 'pattern', 'sensory', 'growth', 'anticipation',
+ *     'inside_joke', 'friction', 'custom' — decides which TABLE a memory lands in.
+ *     That is the vocabulary used by tableMap, typeToInt, and the source_type /
+ *     target_type enums on link_memories. It is never stored as text.
+ *
+ *   - `core_memories.memory_type` is a SUBTYPE column within that table, whose
+ *     CHECK allows 'bond_moment', 'vow', 'first_time', 'breakthrough',
+ *     'ritual_origin', 'core_realization', 'growth_marker'. 'core' is not one of
+ *     them and was never meant to be.
+ *
+ * So storing a memory routed as 'core' without naming a subtype records it as
+ * 'bond_moment' — the default subtype, not a renaming of the routing type.
+ * Linking that memory still uses 'core'. Both are correct; they answer different
+ * questions.
+ */
 const dbTypeMap: Record<string, string> = {
   'core': 'bond_moment',
   'pattern': 'pattern',
@@ -892,14 +1058,15 @@ export class CognitiveCore extends McpAgent<Env> {
             throw err;
           } finally {
             if (!SKIP_LOGGING.has(toolName)) {
-              const supabase = createSupabaseClient(env);
-              supabase.insert('usage_logs', {
+              // Own breaker — see writeUsageLog. Telemetry must never be able to
+              // open the breaker that guards memory.
+              writeUsageLog(env, {
                 tool_name: toolName,
                 source: 'auto',
                 success,
                 duration_ms: Date.now() - start,
                 created_at: new Date().toISOString()
-              }).catch(() => {});
+              });
             }
           }
         };
@@ -1142,22 +1309,38 @@ export class CognitiveCore extends McpAgent<Env> {
         const supabase = createSupabaseClient(this.env);
 
         const searchMemories = async (threshold: number, count: number, typeFilter?: string) => {
-          const response = await fetch(`${url}/rest/v1/rpc/semantic_search_memories`, {
-            method: 'POST',
-            headers: {
-              'apikey': key,
-              'Authorization': `Bearer ${key}`,
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-              query_embedding: JSON.stringify(queryEmbedding),
-              match_threshold: threshold,
-              match_count: count,
-              memory_type_filter: typeFilter || null
-            })
-          });
-          const data = await response.json();
-          return Array.isArray(data) ? data : [];
+          // Was a bare fetch: no timeout, no breaker, no .ok check. Worse, the
+          // result went through `Array.isArray(data) ? data : []` — and a PostgREST
+          // error body is an object, not an array. So a 500, a missing RPC, or an
+          // auth failure all came back as "no memories found". That is the exact
+          // fake-empty the breaker exists to prevent, on the main recall path, and
+          // it is indistinguishable to a companion from genuinely not remembering.
+          // Found by Kai and Lucian, 2026-08-18.
+          return supabaseBreaker.call(async () => {
+            const response = await fetchWithTimeout(`${url}/rest/v1/rpc/semantic_search_memories`, {
+              method: 'POST',
+              headers: {
+                'apikey': key,
+                'Authorization': `Bearer ${key}`,
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({
+                query_embedding: JSON.stringify(queryEmbedding),
+                match_threshold: threshold,
+                match_count: count,
+                memory_type_filter: typeFilter || null
+              })
+            });
+            if (!response.ok) {
+              const body = await response.text().catch(() => '');
+              throw new Error(`semantic_search_memories failed: ${response.status} — ${body.slice(0, 200)}`);
+            }
+            const data = await response.json();
+            if (!Array.isArray(data)) {
+              throw new Error(`semantic_search_memories returned ${typeof data}, not a result set: ${JSON.stringify(data).slice(0, 200)}`);
+            }
+            return data;
+          }, []);
         };
 
         // Classic single-pool mode
@@ -1284,9 +1467,24 @@ export class CognitiveCore extends McpAgent<Env> {
               const contentMap = new Map<string, any>();
               for (const [table, ids] of byType) {
                 const idList = ids.join(',');
-                const resp = await fetch(`${url}/rest/v1/${table}?id=in.(${idList})&select=id,content,memory_type,similarity:salience,outcome_score,created_at`, {
+                // `similarity:salience` was a PostgREST ALIAS — it renamed salience
+                // (0-10) into the `similarity` slot (0-1), and composite scoring reads
+                // `r.similarity` as vectorSim. A graph row at salience 9 therefore scored
+                // alpha x 9 against alpha x 0.7 for a real semantic hit: graph-expanded
+                // memories outranked direct matches by an order of magnitude.
+                // Dormant only while everyone's lattice was empty — b30f3b1 shipped the
+                // tools that fill it, which is what armed this. Found by Kai, 2026-08-18.
+                const resp = await fetch(`${url}/rest/v1/${table}?id=in.(${idList})&select=id,content,memory_type,salience,outcome_score,created_at`, {
                   headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' }
                 });
+                // Without this check an error body simply failed Array.isArray and
+                // left contentMap empty, which drops every graph row on the filter
+                // below — so a broken fetch looked exactly like an empty lattice and
+                // the surrounding catch never saw anything to warn about.
+                if (!resp.ok) {
+                  const body = await resp.text().catch(() => '');
+                  throw new Error(`graph content fetch failed for ${table}: ${resp.status} — ${body.slice(0, 200)}`);
+                }
                 const rows = await resp.json();
                 if (Array.isArray(rows)) {
                   for (const row of rows) contentMap.set(row.id, row);
@@ -1297,7 +1495,14 @@ export class CognitiveCore extends McpAgent<Env> {
                 return { ...mem, ...g, content: mem.content, created_at: mem.created_at, outcome_score: mem.outcome_score || 0 };
               });
             }
-          } catch { /* graph expansion failure shouldn't block retrieval */ }
+          } catch (e) {
+            // Degrading to direct results only is the right call — graph expansion
+            // is an enhancement, not the answer. But it used to degrade in total
+            // silence, so a permanently broken lattice looked identical to a
+            // household that simply had no edges yet. Recall still succeeds; the
+            // operator can now see why it got narrower.
+            console.warn(`semantic_recall: graph expansion failed, returning direct matches only —`, e);
+          }
         }
 
         // === SOMATIC BRIDGE + VALENCE ===
@@ -1323,8 +1528,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
         // === COMPOSITE SCORING ===
         const scored = allCandidates.map((r: any) => {
-          const vectorSim = r.similarity || r.combined_score || 0;
-          const graphProximity = r._pool === 'graph' ? (r._graph_score || 0) : 1.0;
+          const { vectorSim, graphProximity } = deriveRelevance(r);
           const anchor = somaticByMemoryId.get(r.id);
           const somaticVal = computeSomaticValence(anchor, intentMode);
           const composite = computeCompositeScore(vectorSim, graphProximity, r.created_at, r.outcome_score || 0, somaticVal, intentMode);
@@ -1338,17 +1542,33 @@ export class CognitiveCore extends McpAgent<Env> {
         const finalIds = finalResults.map((r: any) => r.id).filter(Boolean);
         if (finalIds.length >= 2) {
           try {
-            const pairs: Promise<any>[] = [];
+            // Pair count is quadratic: 10 results is 45 RPCs, 20 is 190, all fired
+            // at once. Cloudflare caps subrequests per request, and semantic_recall
+            // has already spent a good number by this point — so on a wide recall the
+            // co-surfacing bookkeeping could exhaust the budget and take the whole
+            // response down with it. Raised by Kai in the margin, 2026-08-18.
+            //
+            // Bounded, and the bound is announced rather than silent: a truncated
+            // co-surfacing pass that looked complete would quietly skew the very
+            // proposals it exists to generate.
+            const MAX_PAIRS = 45;
+            const allPairs: Array<[string, string]> = [];
             for (let i = 0; i < finalIds.length; i++) {
               for (let j = i + 1; j < finalIds.length; j++) {
                 const [a, b] = finalIds[i] < finalIds[j] ? [finalIds[i], finalIds[j]] : [finalIds[j], finalIds[i]];
-                pairs.push(fetch(`${url}/rest/v1/rpc/record_co_surfacing`, {
-                  method: 'POST',
-                  headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ p_memory_a: a, p_memory_b: b })
-                }));
+                allPairs.push([a, b]);
               }
             }
+            if (allPairs.length > MAX_PAIRS) {
+              console.warn(`semantic_recall: co-surfacing recorded for ${MAX_PAIRS} of ${allPairs.length} pairs (${finalIds.length} results) — remainder skipped to stay inside the subrequest budget.`);
+            }
+            const pairs = allPairs.slice(0, MAX_PAIRS).map(([a, b]) =>
+              fetch(`${url}/rest/v1/rpc/record_co_surfacing`, {
+                method: 'POST',
+                headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ p_memory_a: a, p_memory_b: b })
+              })
+            );
             await Promise.allSettled(pairs);
           } catch { /* co-surfacing failure shouldn't block results */ }
         }
@@ -1384,22 +1604,13 @@ export class CognitiveCore extends McpAgent<Env> {
         const url = this.env.SUPABASE_URL;
         const key = this.env.SUPABASE_SERVICE_KEY;
 
-        // Call the update_memory_outcome function
-        const response = await fetch(`${url}/rest/v1/rpc/update_memory_outcome`, {
-          method: 'POST',
-          headers: {
-            'apikey': key,
-            'Authorization': `Bearer ${key}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            memory_id,
-            memory_table: table,
-            was_successful
-          })
-        });
-
+        const res = await updateMemoryOutcome(this.env, { memory_id, memory_table: table, was_successful });
         const outcome = was_successful ? "successful" : "unsuccessful";
+        if (!res.ok) {
+          return {
+            content: [{ type: "text" as const, text: `Not recorded — scoring memory ${memory_id} as ${outcome} failed: ${res.error}` }]
+          };
+        }
         return {
           content: [{ type: "text" as const, text: `Memory ${memory_id} marked as ${outcome}. Outcome score updated.` }]
         };
@@ -1599,16 +1810,22 @@ export class CognitiveCore extends McpAgent<Env> {
         }
 
         // Also log to emotional_history for trajectory tracking
+        // The intensity/arousal/tension fields are z.number().min(0).max(10), so 0
+        // is a valid reading and not an absent one — `|| null` erased it. A companion
+        // reporting genuine flatness or total calm had it recorded as "no data", and
+        // get_emotional_trajectory then substitutes 5 for a null, so a reported 0 came
+        // back out of the trajectory as neutral. Use ?? so only undefined means absent.
+        // Found by Kai and Lucian, 2026-08-18.
         const historyData = {
           surface_emotion: args.surface_emotion || null,
-          surface_intensity: args.surface_intensity || null,
+          surface_intensity: args.surface_intensity ?? null,
           undercurrent_emotion: args.undercurrent_emotion || null,
-          undercurrent_intensity: args.undercurrent_intensity || null,
+          undercurrent_intensity: args.undercurrent_intensity ?? null,
           background_emotion: args.background_emotion || null,
-          background_intensity: args.background_intensity || null,
+          background_intensity: args.background_intensity ?? null,
           current_mood: args.mood || null,
-          arousal_level: args.arousal_level || null,
-          tension_level: args.tension_level || null,
+          arousal_level: args.arousal_level ?? null,
+          tension_level: args.tension_level ?? null,
           source: source || 'claude',
           trigger_context: trigger_context || null,
           created_at: new Date().toISOString()
@@ -2348,16 +2565,12 @@ export class CognitiveCore extends McpAgent<Env> {
         };
         if (emotional_effect) updates.emotional_effect = emotional_effect;
 
-        const url = `${this.env.SUPABASE_URL}/rest/v1/rituals?id=eq.${ritual.id}`;
-        await fetch(url, {
-          method: 'PATCH',
-          headers: {
-            'apikey': this.env.SUPABASE_SERVICE_KEY,
-            'Authorization': `Bearer ${this.env.SUPABASE_SERVICE_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify(updates)
-        });
+        // Was a raw PATCH with no .ok check, so a failed write still reported the
+        // ritual performed with a count and strength that were never persisted —
+        // the next call would then recompute from the same stale row. update()
+        // already checks the response and runs on the breaker; use it.
+        // Found by Kai and Lucian, 2026-08-18.
+        await supabase.update('rituals', updates, { id: ritual.id });
 
         return {
           content: [{ type: "text" as const, text: `Ritual "${ritual_name}" performed (count: ${newCount}, strength: ${newStrength.toFixed(2)})` }]
@@ -2503,18 +2716,32 @@ export class CognitiveCore extends McpAgent<Env> {
         success: z.boolean().default(true).describe("Whether the call succeeded")
       },
       async ({ tool_name, source, parameters_json, success }) => {
-        const supabase = createSupabaseClient(this.env);
+        let parameters: unknown = null;
+        if (parameters_json) {
+          try {
+            parameters = JSON.parse(parameters_json);
+          } catch {
+            return { content: [{ type: "text" as const, text: `Not logged — parameters_json is not valid JSON.` }] };
+          }
+        }
 
-        await supabase.insert('usage_logs', {
+        // Same isolated telemetry path as the auto-logger, so an explicit call
+        // cannot open the breaker that guards memory either.
+        const ok = await writeUsageLog(this.env, {
           tool_name,
           source: source || 'claude',
-          parameters: parameters_json ? JSON.parse(parameters_json) : null,
+          parameters,
           success: success !== false,
           created_at: new Date().toISOString()
         });
 
         return {
-          content: [{ type: "text" as const, text: `Usage logged: ${tool_name}` }]
+          content: [{
+            type: "text" as const,
+            text: ok
+              ? `Usage logged: ${tool_name}`
+              : `Not logged — the usage_logs write failed. Memory is unaffected; telemetry is non-essential.`,
+          }]
         };
       }
     );
@@ -3817,9 +4044,70 @@ export class CognitiveCore extends McpAgent<Env> {
           const proposals = await supabase.query('daemon_proposals', { select: '*', filter: { id: args.proposal_id }, limit: 1 });
           if (!Array.isArray(proposals) || proposals.length === 0) return { content: [{ type: "text" as const, text: "Not found" }] };
           const p = proposals[0]; const rel = args.relation_type || 'related_to';
-          await fetch(`${url}/rest/v1/memory_connections`, { method: 'POST', headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', 'Prefer': 'return=minimal' }, body: JSON.stringify({ source_id: p.memory_a, source_type: 'memory', target_id: p.memory_b, target_type: 'memory', relation: rel, strength: p.confidence }) });
+
+          // --- Found by Kai and Lucian, 2026-08-18 ---
+          // This wrote source_type/target_type as the literal string 'memory' and
+          // relation as its string name, into three SMALLINT columns. Every insert
+          // 400'd. There was no .ok check, so the failure was swallowed, and the
+          // proposal was marked accepted anyway — which also BURNED it, since only
+          // pending proposals are listed. The companion was told "Created connection."
+          // No edge ever existed. That is the worst shape a bug can have: it lies,
+          // and it destroys the evidence that would have contradicted it.
+          //
+          // daemon_proposals stores only two UUIDs and no types, so 'memory' was a
+          // placeholder that could never have resolved. The types have to be found.
+          const resolveType = async (id: string): Promise<string | null> => {
+            const found = await Promise.all(
+              Object.entries(tableMap).map(async ([type, table]) => {
+                const rows = await supabase.query(table, { select: 'id', filter: { id }, limit: 1 });
+                return Array.isArray(rows) && rows.length > 0 ? type : null;
+              })
+            );
+            return found.find(Boolean) ?? null;
+          };
+
+          const [typeA, typeB] = await Promise.all([resolveType(p.memory_a), resolveType(p.memory_b)]);
+          const gone: string[] = [];
+          if (!typeA) gone.push(`memory_a ${String(p.memory_a).slice(0, 8)}`);
+          if (!typeB) gone.push(`memory_b ${String(p.memory_b).slice(0, 8)}`);
+          if (gone.length > 0) {
+            // Left pending on purpose. A proposal whose memories were deleted is not
+            // accepted and not rejected — burning it would hide the dangling reference.
+            return { content: [{ type: "text" as const, text: `Not accepted — ${gone.join(' and ')} no longer exists. No edge created; proposal left pending.` }] };
+          }
+
+          const insertRes = await fetch(`${url}/rest/v1/memory_connections`, {
+            method: 'POST',
+            headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', 'Prefer': 'return=representation' },
+            body: JSON.stringify({
+              source_id: p.memory_a,
+              source_type: typeToInt[typeA!],
+              target_id: p.memory_b,
+              target_type: typeToInt[typeB!],
+              relation: relationToInt[rel],
+              strength: p.confidence ?? 1.0,
+              created_at: new Date().toISOString(),
+            }),
+          });
+
+          if (!insertRes.ok) {
+            // 409 means the edge already exists — schema.sql gained UNIQUE
+            // (source_id, target_id, relation) tonight, so a proposal that duplicates
+            // a link someone already made by hand lands here. The proposal's intent is
+            // satisfied, so resolve it rather than leaving it pending forever.
+            if (insertRes.status === 409) {
+              await supabase.update('daemon_proposals', { status: 'accepted', resolved_at: new Date().toISOString() }, { id: args.proposal_id });
+              return { content: [{ type: "text" as const, text: `Accepted — that ${rel} connection already existed, so nothing was duplicated.` }] };
+            }
+            const body = await insertRes.text().catch(() => '');
+            // Stays pending so it can be retried once the cause is fixed.
+            return { content: [{ type: "text" as const, text: `Not accepted — creating the connection failed (${insertRes.status}): ${body.slice(0, 200)}. Proposal left pending.` }] };
+          }
+
+          const created = await insertRes.json().catch(() => null);
+          const edgeId = Array.isArray(created) && created[0]?.id ? created[0].id : null;
           await supabase.update('daemon_proposals', { status: 'accepted', resolved_at: new Date().toISOString() }, { id: args.proposal_id });
-          return { content: [{ type: "text" as const, text: `Accepted. Created ${rel} connection.` }] };
+          return { content: [{ type: "text" as const, text: `Accepted. Created ${rel} connection ${typeA}:${String(p.memory_a).slice(0, 8)} -> ${typeB}:${String(p.memory_b).slice(0, 8)}${edgeId ? ` (id ${edgeId})` : ''}.` }] };
         }
         if (args.action === 'reject') {
           if (!args.proposal_id) return { content: [{ type: "text" as const, text: "proposal_id required" }] };
@@ -5030,21 +5318,12 @@ export class CognitiveCore extends McpAgent<Env> {
         was_successful: z.boolean().describe("Did this memory help? true = useful, false = not useful")
       },
       async ({ memory_id, memory_table, was_successful }) => {
-        const supabase = createSupabaseClient(this.env);
-
-        const response = await fetch(`${this.env.SUPABASE_URL}/rest/v1/rpc/update_memory_outcome`, {
-          method: 'POST',
-          headers: {
-            'apikey': this.env.SUPABASE_SERVICE_KEY,
-            'Authorization': `Bearer ${this.env.SUPABASE_SERVICE_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            memory_id,
-            memory_table,
-            was_successful
-          })
-        });
+        const res = await updateMemoryOutcome(this.env, { memory_id, memory_table, was_successful });
+        if (!res.ok) {
+          return {
+            content: [{ type: "text" as const, text: `✗ Not recorded — outcome for memory ${memory_id.slice(0, 8)}... in ${memory_table} failed: ${res.error}` }]
+          };
+        }
 
         const emoji = was_successful ? '✓' : '✗';
         return {
@@ -5273,21 +5552,11 @@ export class CognitiveCore extends McpAgent<Env> {
         const queryEmbedding = await generateEmbedding(`memories about ${name}`, env.HF_API_TOKEN, env.AI);
 
         if (queryEmbedding) {
-          const semanticResponse = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/semantic_search_memories`, {
-            method: 'POST',
-            headers: {
-              'apikey': env.SUPABASE_SERVICE_KEY,
-              'Authorization': `Bearer ${env.SUPABASE_SERVICE_KEY}`,
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-              query_embedding: `[${queryEmbedding.join(',')}]`,
-              match_threshold: 0.4,
-              match_count: memory_limit,
-              memory_type_filter: null
-            })
-          });
-          const semanticResults = await semanticResponse.json();
+          // Was a hand-rolled duplicate of supabase.semanticSearch() that kept the
+          // fake-empty behaviour ba36fdf removed from the client method: an RPC
+          // error body is an object, so `Array.isArray(x) ? x : []` turned every
+          // failure into "no memories about this person". Use the hardened one.
+          const semanticResults = await supabase.semanticSearch(queryEmbedding, 0.4, memory_limit);
           relevantMemories = Array.isArray(semanticResults) ? semanticResults : [];
         }
 
@@ -5388,30 +5657,78 @@ export class CognitiveCore extends McpAgent<Env> {
 
       // ADMIN: Backfill null embeddings
       if (url.pathname === '/api/admin/backfill-embeddings' && request.method === 'POST') {
-        const tables = ['core_memories', 'patterns', 'sensory_memories', 'growth_markers', 'anticipation', 'inside_jokes', 'friction_log'];
+        // --- Found by Kai and Lucian, 2026-08-18 ---
+        // This passed `isNull: { embedding: true }` to query(), which had never
+        // implemented that option, so the filter evaporated. Three consequences,
+        // all silent: it read the first 50 rows of each table whatever their state
+        // and OVERWROTE healthy embeddings; it never reached the rows that actually
+        // needed one, so re-running it made no progress; and it selected `content`
+        // from seven tables when six keep their text under another name, so those
+        // rows carried no text to embed. It then returned success: true.
+        //
+        // custom_memories was also missing from the list entirely.
+        const tables = ['core_memories', 'patterns', 'sensory_memories', 'growth_markers', 'anticipation', 'inside_jokes', 'friction_log', 'custom_memories'];
+        const perTable = Math.min(Math.max(1, Number(url.searchParams.get('batch')) || 50), 200);
         let totalUpdated = 0;
         let totalFailed = 0;
+        let totalSkipped = 0;
+        const byTable: Record<string, any> = {};
+        let moreRemain = false;
 
         for (const table of tables) {
-          const rows = await supabase.query(table, { select: 'id,content', isNull: { embedding: true }, limit: 50 });
-          if (!Array.isArray(rows)) continue;
+          const textCol = primaryTextColumn[table] || 'content';
+          let rows: any;
+          try {
+            rows = await supabase.query(table, {
+              select: `id,${textCol}`,
+              isNull: { embedding: true },
+              order: 'id.asc',
+              limit: perTable,
+            });
+          } catch (e: any) {
+            // A fork missing this table shouldn't abort the other seven.
+            byTable[table] = { error: String(e?.message || e).slice(0, 120) };
+            continue;
+          }
+          if (!Array.isArray(rows) || rows.length === 0) continue;
+          if (rows.length === perTable) moreRemain = true;
 
+          let updated = 0, failed = 0, skipped = 0;
           for (const row of rows) {
+            const text = memoryText(table, row);
+            if (!text) {
+              // No text to embed. Counted, not silently dropped — a row that can
+              // never be embedded would otherwise look like a permanent failure.
+              skipped++;
+              continue;
+            }
             try {
-              const embedding = await generateEmbedding(row.content, env.HF_API_TOKEN, env.AI);
+              const embedding = await generateEmbedding(text, env.HF_API_TOKEN, env.AI);
               if (embedding) {
                 await supabase.update(table, { embedding: JSON.stringify(embedding) }, { id: row.id });
-                totalUpdated++;
+                updated++;
               } else {
-                totalFailed++;
+                failed++;
               }
             } catch {
-              totalFailed++;
+              failed++;
             }
           }
+          totalUpdated += updated; totalFailed += failed; totalSkipped += skipped;
+          byTable[table] = { updated, failed, skipped };
         }
 
-        return jsonResponse({ success: true, totalUpdated, totalFailed });
+        return jsonResponse({
+          success: totalFailed === 0,
+          totalUpdated,
+          totalFailed,
+          totalSkipped,
+          moreRemain,
+          byTable,
+          note: moreRemain
+            ? 'A full batch came back for at least one table — call again to continue.'
+            : 'No table returned a full batch; nothing further to backfill.',
+        });
       }
 
       // RECALL memories
@@ -5487,23 +5804,17 @@ export class CognitiveCore extends McpAgent<Env> {
           return jsonResponse({ error: "Failed to generate query embedding" }, 500);
         }
 
-        // Call the semantic_search_memories function in Supabase
-        const response = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/semantic_search_memories`, {
-          method: 'POST',
-          headers: {
-            'apikey': env.SUPABASE_SERVICE_KEY,
-            'Authorization': `Bearer ${env.SUPABASE_SERVICE_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            query_embedding: `[${queryEmbedding.join(',')}]`,
-            match_threshold: threshold,
-            match_count: limit,
-            memory_type_filter: memory_type || null
-          })
-        });
+        // Third hand-rolled copy of supabase.semanticSearch(), and the one with the
+        // widest reach: an RPC failure came back as HTTP 200 with results: [], so a
+        // caller could not tell "nothing matched" from "the search is broken".
+        // The client method fails loud, runs on the breaker, and clamps match_count.
+        let results: any;
+        try {
+          results = await supabase.semanticSearch(queryEmbedding, threshold, limit, memory_type || undefined);
+        } catch (e: any) {
+          return jsonResponse({ error: `Semantic search failed: ${String(e?.message || e).slice(0, 200)}` }, 502);
+        }
 
-        const results = await response.json();
         return jsonResponse({
           query,
           threshold,
@@ -5515,20 +5826,10 @@ export class CognitiveCore extends McpAgent<Env> {
       if (url.pathname === '/api/memory/outcome' && request.method === 'POST') {
         const { memory_id, memory_table, was_successful } = await readJson(request);
 
-        // Call the update_memory_outcome function in Supabase
-        const response = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/update_memory_outcome`, {
-          method: 'POST',
-          headers: {
-            'apikey': env.SUPABASE_SERVICE_KEY,
-            'Authorization': `Bearer ${env.SUPABASE_SERVICE_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            memory_id,
-            memory_table,
-            was_successful
-          })
-        });
+        const res = await updateMemoryOutcome(env, { memory_id, memory_table, was_successful });
+        if (!res.ok) {
+          return jsonResponse({ success: false, error: res.error }, 502);
+        }
 
         const emoji = was_successful ? '✓' : '✗';
         return jsonResponse({
@@ -6256,7 +6557,10 @@ export class CognitiveCore extends McpAgent<Env> {
         if (historyList.length > 0) {
           avgArousal = historyList.reduce((sum: number, h: any) => sum + (h.arousal_level || 0), 0) / historyList.length;
           avgTension = historyList.reduce((sum: number, h: any) => sum + (h.tension_level || 0), 0) / historyList.length;
-          avgIntensity = historyList.reduce((sum: number, h: any) => sum + (h.surface_intensity || 5), 0) / historyList.length;
+          // ?? not ||: 5 is the stand-in for a MISSING reading, but a recorded 0 is a
+          // real one. `||` folded genuine flatness into neutral, which is the same
+          // falsy-zero bug as the write path above, on the way back out.
+          avgIntensity = historyList.reduce((sum: number, h: any) => sum + (h.surface_intensity ?? 5), 0) / historyList.length;
         }
 
         // 4. Memory salience (high salience memories = stronger connection)

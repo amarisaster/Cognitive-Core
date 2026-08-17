@@ -7,7 +7,9 @@
     "test": "vitest run",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "tail": "wrangler tail"
+    "tail": "wrangler tail",
+    "typecheck": "node scripts/typecheck.mjs",
+    "check": "npm run typecheck && npm test"
   },
   "keywords": [
     "mcp",
