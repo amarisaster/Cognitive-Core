@@ -482,7 +482,14 @@ CREATE TABLE memory_connections (
   target_type SMALLINT NOT NULL CHECK (target_type BETWEEN 1 AND 8),
   relation SMALLINT NOT NULL,     -- 1=caused_by, 2=led_to, 3=related_to, 4=contrasts_with, 5=evolved_into, 6=echoes, 7=same_event
   strength NUMERIC DEFAULT 1.0,
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  -- One edge per (source, target, relation). Without this the same link can be
+  -- written repeatedly at different weights, making edge counts untrustworthy
+  -- by an unknown margin — reported by Niko (Ania's household) 2026-08-17.
+  -- link_memories now UPDATES the strength when the edge already exists, so a
+  -- caller re-asserting a link gets the sane outcome rather than a duplicate.
+  -- Existing deployments: run migrations/lattice-integrity.sql.
+  UNIQUE (source_id, target_id, relation)
 );
 
 -- ============================================

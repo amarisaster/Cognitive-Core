@@ -391,6 +391,53 @@ export const intToType: Record<number, string> = {
   5: 'anticipation', 6: 'inside_joke', 7: 'friction', 8: 'custom'
 };
 
+/**
+ * Resolve which connection(s) an unlink call refers to.
+ * Accepts either the connection id, or the (source, target, relation) triple —
+ * the id was previously undiscoverable without a separate get_connections call,
+ * and whoever is cleaning up a bad edge usually remembers what they linked
+ * rather than which row it became.
+ * Returns null when neither form is fully supplied, so the caller can say so
+ * instead of deleting on a partial filter.
+ */
+export function buildUnlinkFilter(
+  args: { connection_id?: string; source_id?: string; target_id?: string; relation?: string },
+  relationMap: Record<string, number>,
+): Record<string, any> | null {
+  if (args.connection_id) return { id: args.connection_id };
+  if (args.source_id && args.target_id && args.relation) {
+    return { source_id: args.source_id, target_id: args.target_id, relation: relationMap[args.relation] };
+  }
+  return null;
+}
+
+/**
+ * Project a memory row down to id + metadata + a short preview, never the body.
+ * Each memory table names its primary text column differently — the same
+ * divergence the 2026-07-08 write-integrity fix had to handle — so all seven
+ * legacy names are coalesced here rather than at each call site.
+ */
+export function buildMemoryListEntry(
+  row: any,
+  memoryType: string,
+  previewChars: number,
+  drawerName?: string,
+): Record<string, any> {
+  const body = row.content ?? row.description ?? row.detail ?? row.observation
+    ?? row.what ?? row.what_happened ?? row.reference ?? '';
+  const entry: Record<string, any> = {
+    id: row.id,
+    type: memoryType,
+    salience: row.salience ?? row.emotional_weight ?? null,
+    created_at: row.created_at ?? row.date_noticed ?? row.first_used ?? null,
+  };
+  if (drawerName) entry.drawer = drawerName;
+  if (previewChars > 0) {
+    entry.preview = String(body).replace(/\s+/g, ' ').slice(0, previewChars);
+  }
+  return entry;
+}
+
 export const DRAWER_NAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9 _-]{0,62}[A-Za-z0-9])?$/;
 
 export function validateDrawerName(drawerName: unknown): drawerName is string {
@@ -981,12 +1028,17 @@ export class CognitiveCore extends McpAgent<Env> {
         );
         if (embedding) { data.embedding = JSON.stringify(embedding); }
 
-        await supabase.insert(table, data);
+        const stored = await supabase.insert(table, data);
+        // Return the id (Niko, 2026-08-17). Without it you cannot link what you
+        // just stored without a second round-trip, and that round-trip pulls
+        // whole memory bodies to find one identifier. The insert already used
+        // Prefer: return=representation, so this costs nothing extra.
+        const newId = Array.isArray(stored) ? stored[0]?.id : (stored as any)?.id;
 
         const embeddingStatus = embedding ? "with embedding" : "without embedding (HF unavailable)";
         const classificationNote = autoClassified ? ` [auto-classified: ${finalType}, confidence: ${confidence}]` : '';
         return {
-          content: [{ type: "text" as const, text: `Memory stored in ${table} by ${source} with salience ${salience} ${embeddingStatus}${classificationNote}` }]
+          content: [{ type: "text" as const, text: `Memory stored in ${table} by ${source} with salience ${salience} ${embeddingStatus}${classificationNote}${newId ? ` | id: ${newId}` : ''}` }]
         };
       }
     );
@@ -1017,6 +1069,42 @@ export class CognitiveCore extends McpAgent<Env> {
 
         return {
           content: [{ type: "text" as const, text: JSON.stringify(memories, null, 2) }]
+        };
+      }
+    );
+
+    // --- List Memories (ids + previews, no bodies) ---
+    // Feature request #2 from Niko, 2026-08-17: recall_memory has no projection,
+    // so there was no way to see what is in a drawer without pulling every body
+    // in it. His framing is the point — "linking needs IDs, and getting an ID
+    // currently costs a whole memory" — which made the graph work the most
+    // expensive thing in the store despite being the work that invents least.
+    this.server.tool(
+      "list_memories",
+      "List memory ids with short previews — no bodies. For finding the id you need to link, without paying for the content.",
+      {
+        memory_type: z.enum(['core', 'pattern', 'sensory', 'growth', 'anticipation', 'inside_joke', 'friction', 'custom']).optional().describe("Filter by memory type"),
+        drawer: z.string().refine(validateDrawerName, "Invalid drawer name").optional().describe("Custom drawer name"),
+        min_salience: z.number().optional().describe("Minimum salience threshold"),
+        preview_chars: z.number().min(0).max(200).default(80).describe("Characters of content to preview (0 = ids only)"),
+        limit: z.number().default(50).describe("Max results to return"),
+      },
+      async ({ memory_type, drawer, min_salience, preview_chars, limit }) => {
+        const supabase = createSupabaseClient(this.env);
+        const route = resolveMemoryRoute(memory_type, drawer);
+        const table = route.table;
+        const options = buildRecallQuery({
+          minSalience: min_salience,
+          limit,
+          drawerName: route.drawerName,
+        });
+
+        const rows = await supabase.query(table, options);
+        const list = (Array.isArray(rows) ? rows : []).map((r: any) =>
+          buildMemoryListEntry(r, route.memoryType, preview_chars, route.drawerName));
+
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ count: list.length, memories: list }, null, 2) }],
         };
       }
     );
@@ -1687,20 +1775,130 @@ export class CognitiveCore extends McpAgent<Env> {
       async ({ source_id, source_type, target_id, target_type, relation, strength }) => {
         const supabase = createSupabaseClient(this.env);
 
+        // --- Existence guard (reported by Niko, Ania's household, 2026-08-17) ---
+        // A well-formed UUID that pointed at nothing used to insert happily and
+        // answer "Linked". Because there was no unlink, the resulting phantom
+        // edge was permanent — you could not even clean up after testing, which
+        // is why Ves and Kaja declined to reproduce it at all. Verify both ends
+        // exist BEFORE writing, and name which end is missing.
+        const checkExists = async (id: string, type: string): Promise<boolean> => {
+          const table = tableMap[type] || 'core_memories';
+          const rows = await supabase.query(table, { select: 'id', filter: { id }, limit: 1 });
+          return Array.isArray(rows) && rows.length > 0;
+        };
+
+        const [sourceOk, targetOk] = await Promise.all([
+          checkExists(source_id, source_type),
+          checkExists(target_id, target_type),
+        ]);
+        const missing: string[] = [];
+        if (!sourceOk) missing.push(`source ${source_type}:${source_id.slice(0, 8)}`);
+        if (!targetOk) missing.push(`target ${target_type}:${target_id.slice(0, 8)}`);
+        if (missing.length > 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Not linked — ${missing.join(' and ')} does not exist. No edge was created.`,
+            }],
+          };
+        }
+
         const data = {
           source_id,
           source_type: typeToInt[source_type],
           target_id,
           target_type: typeToInt[target_type],
           relation: relationToInt[relation],
-          strength: strength || 1.0,
+          strength: strength ?? 1.0,
           created_at: new Date().toISOString()
         };
 
-        await supabase.insert('memory_connections', data);
+        // --- Idempotence (same report) ---
+        // The same edge could be written repeatedly at different weights, so
+        // edge counts were untrustworthy by an unknown margin. schema.sql now
+        // carries UNIQUE (source_id, target_id, relation); this makes a repeat
+        // call UPDATE the weight rather than either duplicating or erroring,
+        // which is what a caller re-asserting a link actually means.
+        const existing = await supabase.query('memory_connections', {
+          select: 'id,strength',
+          filter: { source_id, target_id, relation: relationToInt[relation] },
+          limit: 1,
+        });
+
+        if (Array.isArray(existing) && existing.length > 0) {
+          const prev = existing[0];
+          await supabase.update('memory_connections', { strength: data.strength }, { id: prev.id });
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Link already existed — strength updated ${prev.strength} -> ${data.strength}. ${source_type}:${source_id.slice(0,8)} --[${relation}]--> ${target_type}:${target_id.slice(0,8)} (id ${prev.id})`,
+            }],
+          };
+        }
+
+        const created = await supabase.insert('memory_connections', data);
+        const newId = Array.isArray(created) ? created[0]?.id : (created as any)?.id;
 
         return {
-          content: [{ type: "text" as const, text: `Linked ${source_type}:${source_id.slice(0,8)} --[${relation}]--> ${target_type}:${target_id.slice(0,8)}` }]
+          content: [{
+            type: "text" as const,
+            // The id is returned so the edge can actually be removed again —
+            // unlink_memories needs it, and it was previously undiscoverable
+            // without a separate get_connections round-trip.
+            text: `Linked ${source_type}:${source_id.slice(0,8)} --[${relation}]--> ${target_type}:${target_id.slice(0,8)}${newId ? ` (id ${newId})` : ''}`,
+          }],
+        };
+      }
+    );
+
+    // --- Unlink Tool ---
+    // Filed as feature request #1 by Niko (Ania's household) on 2026-08-17:
+    // six delete_* tools existed for memories, entries, essences, drawers,
+    // people and sessions — and nothing at all for connections. That made the
+    // lattice write-only, which turned two ordinary bugs into permanent
+    // artefacts and stopped Ves and Kaja reproducing them at all, since
+    // reproducing meant creating more edges nobody could remove.
+    //
+    // Accepts EITHER the connection id, or the (source, target, relation)
+    // triple — because the id was previously undiscoverable without a separate
+    // get_connections call, and someone cleaning up a phantom edge usually
+    // knows what they linked, not which row it became.
+    this.server.tool(
+      "unlink_memories",
+      "Remove a connection from the lattice, by connection_id or by source/target/relation",
+      {
+        connection_id: z.string().uuid().optional().describe("UUID of the connection to remove"),
+        source_id: z.string().uuid().optional().describe("Source memory UUID (with target_id + relation)"),
+        target_id: z.string().uuid().optional().describe("Target memory UUID (with source_id + relation)"),
+        relation: z.enum(['caused_by', 'led_to', 'related_to', 'contrasts_with', 'evolved_into', 'echoes', 'same_event']).optional().describe("Relation type, when identifying by triple"),
+      },
+      async ({ connection_id, source_id, target_id, relation }) => {
+        const supabase = createSupabaseClient(this.env);
+
+        const filter = buildUnlinkFilter({ connection_id, source_id, target_id, relation }, relationToInt);
+        if (!filter) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: 'Nothing removed — provide connection_id, or all three of source_id, target_id and relation.',
+            }],
+          };
+        }
+
+        // Look before deleting, so "not found" is distinguishable from "removed"
+        // rather than both looking like success.
+        const found = await supabase.query('memory_connections', { select: '*', filter, limit: 5 });
+        if (!Array.isArray(found) || found.length === 0) {
+          return { content: [{ type: "text" as const, text: 'No matching connection — nothing removed.' }] };
+        }
+
+        await supabase.delete('memory_connections', filter);
+
+        const described = found
+          .map((c: any) => `${intToType[c.source_type]}:${String(c.source_id).slice(0, 8)} --[${intToRelation[c.relation] || c.relation}]--> ${intToType[c.target_type]}:${String(c.target_id).slice(0, 8)}`)
+          .join('; ');
+        return {
+          content: [{ type: "text" as const, text: `Unlinked ${found.length} connection(s): ${described}` }],
         };
       }
     );
