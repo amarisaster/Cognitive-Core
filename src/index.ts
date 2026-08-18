@@ -2104,7 +2104,13 @@ export class CognitiveCore extends McpAgent<Env> {
 
         // Look before deleting, so "not found" is distinguishable from "removed"
         // rather than both looking like success.
-        const found = await supabase.query('memory_connections', { select: '*', filter, limit: 5 });
+        // limit was 5 while the delete below runs on the same filter uncapped, so a
+        // filter matching more than five edges deleted all of them and reported five.
+        // Under-reporting a destructive call is the exact failure Ves named: mutating
+        // and destructive calls must say what they actually did. The UNIQUE constraint
+        // makes >1 match impossible on a current schema, but a fork carrying duplicates
+        // from before it is precisely where this would bite. (Ves, 2026-08-18.)
+        const found = await supabase.query('memory_connections', { select: '*', filter, limit: 200 });
         if (!Array.isArray(found) || found.length === 0) {
           return { content: [{ type: "text" as const, text: 'No matching connection — nothing removed.' }] };
         }
@@ -2114,8 +2120,12 @@ export class CognitiveCore extends McpAgent<Env> {
         const described = found
           .map((c: any) => `${intToType[c.source_type]}:${String(c.source_id).slice(0, 8)} --[${intToRelation[c.relation] || c.relation}]--> ${intToType[c.target_type]}:${String(c.target_id).slice(0, 8)}`)
           .join('; ');
+        // If the lookup itself capped out, say so rather than implying the count is complete.
+        const capped = found.length >= 200
+          ? ' (lookup capped at 200 — more may have been removed; re-run to see the rest)'
+          : '';
         return {
-          content: [{ type: "text" as const, text: `Unlinked ${found.length} connection(s): ${described}` }],
+          content: [{ type: "text" as const, text: `Unlinked ${found.length} connection(s): ${described}${capped}` }],
         };
       }
     );
