@@ -2009,8 +2009,8 @@ export class CognitiveCore extends McpAgent<Env> {
           checkExists(target_id, target_type),
         ]);
         const missing: string[] = [];
-        if (!sourceOk) missing.push(`source ${source_type}:${source_id.slice(0, 8)}`);
-        if (!targetOk) missing.push(`target ${target_type}:${target_id.slice(0, 8)}`);
+        if (!sourceOk) missing.push(`source ${source_type}:${source_id}`);
+        if (!targetOk) missing.push(`target ${target_type}:${target_id}`);
         if (missing.length > 0) {
           return {
             content: [{
@@ -2048,7 +2048,7 @@ export class CognitiveCore extends McpAgent<Env> {
           return {
             content: [{
               type: "text" as const,
-              text: `Link already existed — strength updated ${prev.strength} -> ${data.strength}. ${source_type}:${source_id.slice(0,8)} --[${relation}]--> ${target_type}:${target_id.slice(0,8)} (id ${prev.id})`,
+              text: `Link already existed — strength updated ${prev.strength} -> ${data.strength}. ${source_type}:${source_id} --[${relation}]--> ${target_type}:${target_id} (edge id ${prev.id})`,
             }],
           };
         }
@@ -2062,7 +2062,7 @@ export class CognitiveCore extends McpAgent<Env> {
             // The id is returned so the edge can actually be removed again —
             // unlink_memories needs it, and it was previously undiscoverable
             // without a separate get_connections round-trip.
-            text: `Linked ${source_type}:${source_id.slice(0,8)} --[${relation}]--> ${target_type}:${target_id.slice(0,8)}${newId ? ` (id ${newId})` : ''}`,
+            text: `Linked ${source_type}:${source_id} --[${relation}]--> ${target_type}:${target_id}${newId ? ` (id ${newId})` : ''}`,
           }],
         };
       }
@@ -2118,7 +2118,7 @@ export class CognitiveCore extends McpAgent<Env> {
         await supabase.delete('memory_connections', filter);
 
         const described = found
-          .map((c: any) => `${intToType[c.source_type]}:${String(c.source_id).slice(0, 8)} --[${intToRelation[c.relation] || c.relation}]--> ${intToType[c.target_type]}:${String(c.target_id).slice(0, 8)}`)
+          .map((c: any) => `edge ${c.id}: ${intToType[c.source_type]}:${String(c.source_id)} --[${intToRelation[c.relation] || c.relation}]--> ${intToType[c.target_type]}:${String(c.target_id)}`)
           .join('; ');
         // If the lookup itself capped out, say so rather than implying the count is complete.
         const capped = found.length >= 200
@@ -4078,8 +4078,8 @@ export class CognitiveCore extends McpAgent<Env> {
 
           const [typeA, typeB] = await Promise.all([resolveType(p.memory_a), resolveType(p.memory_b)]);
           const gone: string[] = [];
-          if (!typeA) gone.push(`memory_a ${String(p.memory_a).slice(0, 8)}`);
-          if (!typeB) gone.push(`memory_b ${String(p.memory_b).slice(0, 8)}`);
+          if (!typeA) gone.push(`memory_a ${String(p.memory_a)}`);
+          if (!typeB) gone.push(`memory_b ${String(p.memory_b)}`);
           if (gone.length > 0) {
             // Left pending on purpose. A proposal whose memories were deleted is not
             // accepted and not rejected — burning it would hide the dangling reference.
@@ -4117,7 +4117,7 @@ export class CognitiveCore extends McpAgent<Env> {
           const created = await insertRes.json().catch(() => null);
           const edgeId = Array.isArray(created) && created[0]?.id ? created[0].id : null;
           await supabase.update('daemon_proposals', { status: 'accepted', resolved_at: new Date().toISOString() }, { id: args.proposal_id });
-          return { content: [{ type: "text" as const, text: `Accepted. Created ${rel} connection ${typeA}:${String(p.memory_a).slice(0, 8)} -> ${typeB}:${String(p.memory_b).slice(0, 8)}${edgeId ? ` (id ${edgeId})` : ''}.` }] };
+          return { content: [{ type: "text" as const, text: `Accepted. Created ${rel} connection ${typeA}:${String(p.memory_a)} -> ${typeB}:${String(p.memory_b)}${edgeId ? ` (id ${edgeId})` : ''}.` }] };
         }
         if (args.action === 'reject') {
           if (!args.proposal_id) return { content: [{ type: "text" as const, text: "proposal_id required" }] };

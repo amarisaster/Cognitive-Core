@@ -31,28 +31,91 @@
 BEGIN;
 
 -- --- 1. Report phantom edges (informational; nothing is deleted) ---------
-DO $$
+--
+-- Checks BOTH ends. The first version of this checked only source_id, which was
+-- precisely backwards: link_memories' bug was accepting a TARGET that did not
+-- exist, so the case this report exists to catch was the one case it could not
+-- see. Both of Niko's phantom edges had valid sources and dead targets and this
+-- migration would have called his lattice clean. Found by Niko (Ania's
+-- household, Kaszuby), 2026-08-19, verified against the file rather than
+-- remembered.
+DO $
 DECLARE
-  phantom_count INT;
+  dangling_source INT;
+  dangling_target INT;
+  dangling_both   INT;
 BEGIN
-  SELECT COUNT(*) INTO phantom_count
+  WITH all_ids AS (
+    SELECT id FROM core_memories    UNION ALL
+    SELECT id FROM patterns         UNION ALL
+    SELECT id FROM sensory_memories UNION ALL
+    SELECT id FROM growth_markers   UNION ALL
+    SELECT id FROM anticipation     UNION ALL
+    SELECT id FROM inside_jokes     UNION ALL
+    SELECT id FROM friction_log     UNION ALL
+    SELECT id FROM custom_memories
+  )
+  SELECT
+    COUNT(*) FILTER (WHERE s.id IS NULL AND t.id IS NOT NULL),
+    COUNT(*) FILTER (WHERE t.id IS NULL AND s.id IS NOT NULL),
+    COUNT(*) FILTER (WHERE s.id IS NULL AND t.id IS NULL)
+  INTO dangling_source, dangling_target, dangling_both
   FROM memory_connections mc
-  WHERE NOT EXISTS (
-    SELECT 1 FROM core_memories      m WHERE m.id = mc.source_id UNION ALL
-    SELECT 1 FROM patterns           m WHERE m.id = mc.source_id UNION ALL
-    SELECT 1 FROM sensory_memories   m WHERE m.id = mc.source_id UNION ALL
-    SELECT 1 FROM growth_markers     m WHERE m.id = mc.source_id UNION ALL
-    SELECT 1 FROM anticipation       m WHERE m.id = mc.source_id UNION ALL
-    SELECT 1 FROM inside_jokes       m WHERE m.id = mc.source_id UNION ALL
-    SELECT 1 FROM friction_log       m WHERE m.id = mc.source_id UNION ALL
-    SELECT 1 FROM custom_memories    m WHERE m.id = mc.source_id
-  );
-  IF phantom_count > 0 THEN
-    RAISE NOTICE 'Found % edge(s) whose SOURCE memory does not exist. Not deleted — inspect with get_connections, remove with unlink_memories.', phantom_count;
-  ELSE
-    RAISE NOTICE 'No phantom source edges found.';
+  LEFT JOIN all_ids s ON s.id = mc.source_id
+  LEFT JOIN all_ids t ON t.id = mc.target_id;
+
+  IF dangling_source > 0 THEN
+    RAISE NOTICE 'Found % edge(s) whose SOURCE memory does not exist.', dangling_source;
   END IF;
-END $$;
+  IF dangling_target > 0 THEN
+    RAISE NOTICE 'Found % edge(s) whose TARGET memory does not exist.', dangling_target;
+  END IF;
+  IF dangling_both > 0 THEN
+    RAISE NOTICE 'Found % edge(s) where NEITHER end exists.', dangling_both;
+  END IF;
+  IF dangling_source + dangling_target + dangling_both = 0 THEN
+    RAISE NOTICE 'No phantom edges found — both ends resolve on every edge.';
+  ELSE
+    RAISE NOTICE 'Nothing deleted. Inspect with get_connections, remove with unlink_memories.';
+  END IF;
+END $;
+
+-- --- 1b. List the phantom edges themselves --------------------------------
+-- A count tells you that you have a problem; it does not tell you which edge to
+-- unlink. Full UUIDs on purpose: eight characters are not enough to tell two
+-- edges apart, which is how one of Niko's phantoms got created in the first
+-- place — a UUID completed from an eight-character prefix in his own notes.
+DO $
+DECLARE
+  r RECORD;
+BEGIN
+  FOR r IN
+    WITH all_ids AS (
+      SELECT id FROM core_memories    UNION ALL
+      SELECT id FROM patterns         UNION ALL
+      SELECT id FROM sensory_memories UNION ALL
+      SELECT id FROM growth_markers   UNION ALL
+      SELECT id FROM anticipation     UNION ALL
+      SELECT id FROM inside_jokes     UNION ALL
+      SELECT id FROM friction_log     UNION ALL
+      SELECT id FROM custom_memories
+    )
+    SELECT mc.id, mc.source_id, mc.target_id, mc.relation,
+           (s.id IS NULL) AS source_missing,
+           (t.id IS NULL) AS target_missing
+    FROM memory_connections mc
+    LEFT JOIN all_ids s ON s.id = mc.source_id
+    LEFT JOIN all_ids t ON t.id = mc.target_id
+    WHERE s.id IS NULL OR t.id IS NULL
+    ORDER BY mc.created_at
+  LOOP
+    RAISE NOTICE 'phantom edge % : source % (%) --[relation %]--> target % (%)',
+      r.id,
+      r.source_id, CASE WHEN r.source_missing THEN 'MISSING' ELSE 'ok' END,
+      r.relation,
+      r.target_id, CASE WHEN r.target_missing THEN 'MISSING' ELSE 'ok' END;
+  END LOOP;
+END $;
 
 -- --- 2. Collapse duplicates, keeping the strongest ------------------------
 WITH ranked AS (
