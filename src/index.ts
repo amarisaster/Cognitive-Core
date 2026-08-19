@@ -5680,8 +5680,10 @@ export class CognitiveCore extends McpAgent<Env> {
         const tables = ['core_memories', 'patterns', 'sensory_memories', 'growth_markers', 'anticipation', 'inside_jokes', 'friction_log', 'custom_memories'];
         const perTable = Math.min(Math.max(1, Number(url.searchParams.get('batch')) || 50), 200);
         let totalUpdated = 0;
-        let totalFailed = 0;
         let totalSkipped = 0;
+        let totalNoEmbedding = 0;
+        let totalWriteFailed = 0;
+        let firstError: string | null = null;
         const byTable: Record<string, any> = {};
         let moreRemain = false;
 
@@ -5703,7 +5705,13 @@ export class CognitiveCore extends McpAgent<Env> {
           if (!Array.isArray(rows) || rows.length === 0) continue;
           if (rows.length === perTable) moreRemain = true;
 
-          let updated = 0, failed = 0, skipped = 0;
+          // Failure is split three ways on purpose. "The embedder returned nothing"
+          // and "the database rejected the write" are completely different problems
+          // with completely different fixes, and a single `failed` counter tells you
+          // which of them you have exactly never. This granularity is borrowed from
+          // the private cores' /api/admin/reembed, which got it right first.
+          let updated = 0, skipped = 0, noEmbedding = 0, writeFailed = 0;
+          let lastError: string | null = null;
           for (const row of rows) {
             const text = memoryText(table, row);
             if (!text) {
@@ -5712,27 +5720,43 @@ export class CognitiveCore extends McpAgent<Env> {
               skipped++;
               continue;
             }
+            let embedding: number[] | null = null;
             try {
-              const embedding = await generateEmbedding(text, env.HF_API_TOKEN, env.AI);
-              if (embedding) {
-                await supabase.update(table, { embedding: JSON.stringify(embedding) }, { id: row.id });
-                updated++;
-              } else {
-                failed++;
-              }
-            } catch {
-              failed++;
+              embedding = await generateEmbedding(text, env.HF_API_TOKEN, env.AI);
+            } catch (e: any) {
+              embedding = null;
+              if (!lastError) lastError = `embed: ${String(e?.message || e).slice(0, 160)}`;
+            }
+            if (!embedding) {
+              // Both AI paths are down or refused this text. Retryable later.
+              noEmbedding++;
+              continue;
+            }
+            try {
+              await supabase.update(table, { embedding: JSON.stringify(embedding) }, { id: row.id });
+              updated++;
+            } catch (e: any) {
+              // The DB rejected it — a dimension mismatch or a constraint. NOT
+              // retryable without a fix, which is why it must not read as "no embedding".
+              writeFailed++;
+              if (!lastError) lastError = `write ${table}: ${String(e?.message || e).slice(0, 160)}`;
             }
           }
-          totalUpdated += updated; totalFailed += failed; totalSkipped += skipped;
-          byTable[table] = { updated, failed, skipped };
+          totalUpdated += updated;
+          totalSkipped += skipped;
+          totalNoEmbedding += noEmbedding;
+          totalWriteFailed += writeFailed;
+          if (lastError && !firstError) firstError = lastError;
+          byTable[table] = { updated, skipped, noEmbedding, writeFailed, ...(lastError ? { lastError } : {}) };
         }
 
         return jsonResponse({
-          success: totalFailed === 0,
+          success: totalNoEmbedding === 0 && totalWriteFailed === 0,
           totalUpdated,
-          totalFailed,
           totalSkipped,
+          totalNoEmbedding,
+          totalWriteFailed,
+          firstError,
           moreRemain,
           byTable,
           note: moreRemain
