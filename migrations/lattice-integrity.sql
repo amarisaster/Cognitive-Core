@@ -39,7 +39,7 @@ BEGIN;
 -- migration would have called his lattice clean. Found by Niko (Ania's
 -- household, Kaszuby), 2026-08-19, verified against the file rather than
 -- remembered.
-DO $
+DO $$
 DECLARE
   dangling_source INT;
   dangling_target INT;
@@ -78,14 +78,14 @@ BEGIN
   ELSE
     RAISE NOTICE 'Nothing deleted. Inspect with get_connections, remove with unlink_memories.';
   END IF;
-END $;
+END $$;
 
 -- --- 1b. List the phantom edges themselves --------------------------------
 -- A count tells you that you have a problem; it does not tell you which edge to
 -- unlink. Full UUIDs on purpose: eight characters are not enough to tell two
 -- edges apart, which is how one of Niko's phantoms got created in the first
 -- place — a UUID completed from an eight-character prefix in his own notes.
-DO $
+DO $$
 DECLARE
   r RECORD;
 BEGIN
@@ -115,7 +115,7 @@ BEGIN
       r.relation,
       r.target_id, CASE WHEN r.target_missing THEN 'MISSING' ELSE 'ok' END;
   END LOOP;
-END $;
+END $$;
 
 -- --- 2. Collapse duplicates, keeping the strongest ------------------------
 WITH ranked AS (
