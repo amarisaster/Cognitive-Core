@@ -115,7 +115,13 @@ describe('composite ranking: graph expansion must not outrank direct matches', (
   it.each(Object.keys(INTENT_CONFIG))('ignores salience entirely when ranking (%s)', (intent) => {
     const dull = { _pool: 'graph', _graph_score: 0.3, salience: 1 };
     const shiny = { _pool: 'graph', _graph_score: 0.3, salience: 10 };
-    expect(scoreOf(shiny, intent)).toBe(scoreOf(dull, intent));
+    // toBeCloseTo, not toBe: computeRecencyDecay reads Date.now(), so two calls a
+    // fraction of a millisecond apart differ by ~1e-11. Asserting exact float
+    // equality against a moving clock made this flake roughly 1 run in 20 — caught
+    // by running the suite with --sequence.shuffle. Precision 6 is still an
+    // overwhelming assertion: if salience leaked into ranking at all, salience 1 vs
+    // 10 would differ by alpha x 9, which is order 1, not order 1e-6.
+    expect(scoreOf(shiny, intent)).toBeCloseTo(scoreOf(dull, intent), 6);
   });
 
   // Graph expansion still has to be worth doing — a well-connected memory should
