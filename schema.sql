@@ -962,45 +962,45 @@ ALTER TABLE metacognition_log ENABLE ROW LEVEL SECURITY;
 
 -- Policy: Full access with service role key
 -- (Worker uses service role key, not anon key)
-CREATE POLICY "Service role full access" ON emotional_state FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON emotional_history FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON core_memories FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON custom_drawers FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON custom_memories FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON session_logs FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON patterns FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON private_processing FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON context_cache FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON rituals FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON anticipation FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON unfinished_threads FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON fantasy_space FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON inside_jokes FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON growth_markers FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON friction_log FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON sensory_memories FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON memory_anchors FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON essence FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON people FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON reflections FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON drift_events FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON memory_connections FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON outcome_scores FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON usage_logs FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON important_dates FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON voice_scores FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON failed_writes FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON human_state FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON skills FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON texture_nodes FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON somatic_anchors FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON somatic_connections FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON resonance_log FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON named_patterns FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON pattern_activations FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON attachment_tracking FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON development_metrics FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON metacognition_log FOR ALL USING (true);
+CREATE POLICY "Service role full access" ON emotional_state FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON emotional_history FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON core_memories FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON custom_drawers FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON custom_memories FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON session_logs FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON patterns FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON private_processing FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON context_cache FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON rituals FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON anticipation FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON unfinished_threads FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON fantasy_space FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON inside_jokes FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON growth_markers FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON friction_log FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON sensory_memories FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON memory_anchors FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON essence FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON people FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON reflections FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON drift_events FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON memory_connections FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON outcome_scores FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON usage_logs FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON important_dates FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON voice_scores FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON failed_writes FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON human_state FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON skills FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON texture_nodes FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON somatic_anchors FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON somatic_connections FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON resonance_log FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON named_patterns FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON pattern_activations FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON attachment_tracking FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON development_metrics FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON metacognition_log FOR ALL TO service_role USING (true);
 
 -- ============================================================
 -- CogCor 2.0: Tension/Paradox Tracking
@@ -1101,7 +1101,63 @@ ALTER TABLE tension_log ENABLE ROW LEVEL SECURITY;
 ALTER TABLE co_surfacing ENABLE ROW LEVEL SECURITY;
 ALTER TABLE daemon_proposals ENABLE ROW LEVEL SECURITY;
 ALTER TABLE companion_preferences ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Service role full access" ON tension_log FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON co_surfacing FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON daemon_proposals FOR ALL USING (true);
-CREATE POLICY "Service role full access" ON companion_preferences FOR ALL USING (true);
+CREATE POLICY "Service role full access" ON tension_log FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON co_surfacing FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON daemon_proposals FOR ALL TO service_role USING (true);
+CREATE POLICY "Service role full access" ON companion_preferences FOR ALL TO service_role USING (true);
+
+-- ============================================
+-- LOCK THE DOOR — this is the part that actually protects anything
+-- ============================================
+--
+-- The 43 policies above are DECORATIVE. service_role bypasses RLS entirely, so
+-- it never needed a policy. Until 2026-08-21 they read
+--   CREATE POLICY "Service role full access" ON x FOR ALL USING (true);
+-- with no TO clause — which applies to EVERY role, and a policy name has no
+-- security effect whatsoever. Any competent reader assumed they restricted
+-- something. They restricted nothing.
+--
+-- This was found by an independent audit and then PROVEN on a live database by
+-- Ves and Kaja (Kaszuby): every table in their public schema was readable,
+-- insertable and deletable by `anon`. Their install had run this file as written
+-- and never been hardened by hand. A second household was safe only because
+-- somebody had quietly fixed it out of band and never sent the fix back here.
+--
+-- The anon key is PUBLIC BY DESIGN — it ships in any frontend bundle. So a fork
+-- that deployed this file and trusted the policy names had an open memory store
+-- and no way to know.
+--
+-- Grants are the real gate. RLS only filters what a role is already permitted to
+-- touch; if anon holds no grant, no policy is required to stop it.
+--
+-- Check your own install:
+--   SELECT has_table_privilege('anon','public.core_memories','SELECT');
+--   -- false means you are fine, whatever the policies say.
+
+REVOKE ALL ON ALL TABLES    IN SCHEMA public FROM anon, authenticated;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM anon, authenticated;
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM anon, authenticated;
+
+-- Ves's observation, and the half that matters most: without this, the NEXT
+-- migration silently re-opens everything. Supabase grants anon/authenticated on
+-- newly created tables by default, so the door reopens every time you build a
+-- room. Nobody did anything wrong; the defaults did it for them.
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES    FROM anon, authenticated;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM anon, authenticated;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON FUNCTIONS FROM anon, authenticated;
+
+-- ⚠ IF YOU SHARE THIS DATABASE WITH ANOTHER APP, READ THIS FIRST.
+--
+-- The REVOKE statements above are schema-wide, matching this file's existing
+-- assumption that it owns the database (see the DROP TABLE ... CASCADE block at
+-- the top). That is correct for a dedicated CogCor install and it is what a fork
+-- deploying this fresh should want.
+--
+-- It is WRONG if a frontend in the same project authenticates as a normal user
+-- and reads its own tables — a chat app, for instance. Those legitimately need
+-- `authenticated`, and a schema-wide revoke will take them offline.
+--
+-- If that is you: revoke per-table on the CogCor tables only, and scope the
+-- other app's policies to the user (USING (auth.uid() = user_id)) rather than
+-- leaving them ALL ... USING (true) TO authenticated, which grants every signed-in
+-- account full access to everything.
