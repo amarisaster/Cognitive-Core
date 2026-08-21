@@ -108,6 +108,34 @@ describe('writes that take a caller-supplied id must verify a row matched', () =
     ).toEqual([]);
   });
 
+  // Lucian, 2026-08-21: "a test that cannot see a malformed write standing in
+  // front of it." match_skill called supabase.update('skills', s.id, {fields})
+  // against an (table, data, filter) signature — the UUID went in as the request
+  // BODY and the field object became the filter. Guaranteed 400, swallowed by
+  // .catch(() => {}). The check above missed it because it only looks for an
+  // inline `{ id: ... }` filter, and this call had no filter object at all.
+  //
+  // Argument ORDER is a separate defect from argument CONTENT, and needs its own
+  // check. An id in the data position is never correct.
+  it('passes data second and filter third, never an id in the data position', () => {
+    const wrong = sites
+      .map((s) => {
+        const args = s.text.match(/supabase\.(?:update|delete)\(([^)]*)/)?.[1] ?? '';
+        // second argument, naively split — enough to spot `s.id` / `memory_id`
+        const second = args.split(',')[1]?.trim() ?? '';
+        return { line: s.line, second, text: s.text };
+      })
+      .filter(({ second }) => /^[\w.[\]]*\bid\b$|_id$|\.id$/.test(second))
+      .map((s) => `index.ts:${s.line} — second argument is \`${s.second}\`, which is an id, not data`);
+
+    expect(
+      wrong,
+      'supabase.update/delete take (table, data, filter). An id in the second position '
+        + 'sends the id as the request body and turns the field object into the filter — '
+        + 'a guaranteed 400 that a .catch(() => {}) will hide.',
+    ).toEqual([]);
+  });
+
   it('still has guards in place — this test cannot pass by finding nothing', () => {
     // Guards against the check silently becoming a no-op if the call-site shape
     // changes and takesCallerId() stops matching anything.

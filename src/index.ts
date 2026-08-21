@@ -3147,7 +3147,11 @@ export class CognitiveCore extends McpAgent<Env> {
 
           if (scored.length > 0) {
             for (const s of scored) {
-              supabase.update('skills', s.id, { last_used_at: new Date().toISOString(), times_used: (s.times_used || 0) + 1 }).catch(() => {});
+              supabase.update(
+                'skills',
+                { last_used_at: new Date().toISOString(), times_used: (s.times_used || 0) + 1 },
+                { id: s.id },
+              ).catch((e: any) => console.warn(`match_skill usage update failed for ${s.id}: ${e?.message || e}`));
             }
           }
 
@@ -3200,7 +3204,11 @@ export class CognitiveCore extends McpAgent<Env> {
 
         if (scored.length > 0) {
           for (const s of scored) {
-            supabase.update('skills', s.id, { last_used_at: new Date().toISOString(), times_used: (s.times_used || 0) + 1 }).catch(() => {});
+            supabase.update(
+                'skills',
+                { last_used_at: new Date().toISOString(), times_used: (s.times_used || 0) + 1 },
+                { id: s.id },
+              ).catch((e: any) => console.warn(`match_skill usage update failed for ${s.id}: ${e?.message || e}`));
           }
         }
 
