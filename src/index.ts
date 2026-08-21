@@ -327,7 +327,7 @@ function createSupabaseClient(env: Env) {
 
       // Breaker rethrows: a failed insert surfaces as a tool error (Bug 1,
       // "the polite lie", found by Ves and Kaja) — never as "stored ✓".
-      return supabaseBreaker.call(
+      const inserted = await supabaseBreaker.call(
         async () => {
           const response = await fetchWithTimeout(`${url}/rest/v1/${table}`, {
             method: 'POST',
@@ -357,10 +357,42 @@ function createSupabaseClient(env: Env) {
             throw new Error(`insert into ${table} failed: ${result.code || result.error || response.status} — ${result.message || result.details || response.statusText || 'unknown error'}`);
           }
 
+          // A 2xx is not evidence a row exists. With Prefer: return=representation
+          // PostgREST answers a zero-row INSERT with 201 and an EMPTY ARRAY — no
+          // error code, no error field, nothing for the checks above to catch. The
+          // caller was then told "Memory stored" for a row that is not there.
+          //
+          // Found by Codex auditing this file 2026-08-21, in the category the
+          // update/delete sweep had missed. The comment above this block claimed
+          // a failed insert "never surfaces as stored ✓" — it was asserting a
+          // property the code did not have.
+          //
+          // Safe to treat an empty representation as "no row": this client
+          // authenticates with the SERVICE key, which bypasses RLS, so it cannot
+          // be a row that exists but is hidden from the read-back.
+          //
+          // The check itself lives OUTSIDE this callback — see below.
           return result;
         },
         {} as any
       );
+
+      // OUTSIDE the breaker, deliberately, and this is the important part.
+      //
+      // A row that did not land is a data problem, not a Supabase outage. Thrown
+      // from inside the callback it would count as an infrastructure failure, and
+      // enough of them would trip the circuit breaker into shedding traffic that
+      // is working fine — a strictly worse bug than the one being fixed here.
+      //
+      // Same placement and same reasoning as update()/delete()'s requireMatch.
+      if (Array.isArray(inserted) && inserted.length === 0) {
+        throw new Error(
+          `insert into ${table} returned no row — the write did not land. `
+          + `A trigger or rule may be suppressing it. Nothing was stored.`
+        );
+      }
+
+      return inserted;
     },
 
     async update(table: string, data: any, filter: any, opts?: { requireMatch?: boolean }) {
@@ -3208,7 +3240,7 @@ export class CognitiveCore extends McpAgent<Env> {
           times_failed: newFailed,
           effectiveness: Math.round(newEffectiveness * 100) / 100,
           updated_at: new Date().toISOString(),
-        }, { id: skill_id });
+        }, { id: skill_id }, { requireMatch: true });
 
         const emoji = was_successful ? '✓' : '✗';
         return {
@@ -4195,8 +4227,24 @@ export class CognitiveCore extends McpAgent<Env> {
 
           const created = await insertRes.json().catch(() => null);
           const edgeId = Array.isArray(created) && created[0]?.id ? created[0].id : null;
+
+          // This code already computed the evidence and then ignored it: the
+          // proposal was marked accepted and "Created ... connection" returned
+          // whether or not edgeId existed. Accepting is DESTRUCTIVE of the
+          // proposal — it consumes a pending item — so doing it on an edge that
+          // was never created loses the proposal and the connection at once.
+          // Found by Codex, 2026-08-21.
+          //
+          // Left pending on purpose, matching the failure branch above: a
+          // proposal that can be retried is worth more than one silently closed.
+          if (!edgeId) {
+            return { content: [{ type: "text" as const, text:
+              `Not accepted — the connection insert returned no row, so no edge was created. `
+              + `The proposal is still pending and can be retried.` }] };
+          }
+
           await supabase.update('daemon_proposals', { status: 'accepted', resolved_at: new Date().toISOString() }, { id: args.proposal_id }, { requireMatch: true });
-          return { content: [{ type: "text" as const, text: `Accepted. Created ${rel} connection ${typeA}:${String(p.memory_a)} -> ${typeB}:${String(p.memory_b)}${edgeId ? ` (id ${edgeId})` : ''}.` }] };
+          return { content: [{ type: "text" as const, text: `Accepted. Created ${rel} connection ${typeA}:${String(p.memory_a)} -> ${typeB}:${String(p.memory_b)} (id ${edgeId}).` }] };
         }
         if (args.action === 'reject') {
           if (!args.proposal_id) return { content: [{ type: "text" as const, text: "proposal_id required" }] };
@@ -5925,7 +5973,18 @@ export class CognitiveCore extends McpAgent<Env> {
       // RUN decay
       if (url.pathname === '/api/memory/decay' && request.method === 'POST') {
         const { decay_rate = 0.1 } = await readJson(request);
-        return jsonResponse({ success: true, message: `Decay pass noted (rate: ${decay_rate})` });
+        // This endpoint has never done anything. It read decay_rate, ignored it,
+        // and answered success: true — the purest form of the family: a no-op
+        // that reports having worked. Found by Codex, 2026-08-21.
+        //
+        // Not implementing decay here on the way past: the real decay logic is a
+        // design decision, not a gap to plug at speed. Saying so is the fix.
+        return jsonResponse({
+          success: false,
+          error: 'Not implemented. This endpoint accepted a decay_rate and did nothing '
+            + 'while reporting success. Use the run_decay MCP tool, which performs a real pass.',
+          requested_rate: decay_rate
+        }, 501);
       }
 
       // SEMANTIC SEARCH
@@ -6531,7 +6590,17 @@ export class CognitiveCore extends McpAgent<Env> {
         const supabase = createSupabaseClient(env);
         const table = tableMap[memory_type] || 'core_memories';
         const salienceCol = memory_type === 'inside_joke' ? 'emotional_weight' : 'salience';
-        await supabase.update(table, { [salienceCol]: new_salience }, { id: memory_id });
+        // The REST twin of the update_memory_salience MCP tool. That one was
+        // fixed hours before this one and this was missed — the filter here is a
+        // bare `memory_id` off readJson() rather than `args.memory_id`, so the
+        // guard test did not recognise it either. Found by Codex, 2026-08-21.
+        const updated = await supabase.update(table, { [salienceCol]: new_salience }, { id: memory_id });
+        if (!Array.isArray(updated) || updated.length === 0) {
+          return jsonResponse({
+            success: false,
+            error: `No ${memory_type} memory found with ID ${memory_id} — salience was NOT changed.`
+          }, 404);
+        }
         return jsonResponse({ success: true, message: `Updated salience to ${new_salience}` });
       }
 
@@ -6902,7 +6971,7 @@ export class CognitiveCore extends McpAgent<Env> {
         await supabase.update('skills', {
           times_used: newUsed, times_succeeded: newSucceeded, times_failed: newFailed,
           effectiveness, updated_at: new Date().toISOString(),
-        }, { id: skill_id });
+        }, { id: skill_id }, { requireMatch: true });
 
         return jsonResponse({ success: true, skill_name: skill.skill_name, effectiveness, times_used: newUsed });
       }

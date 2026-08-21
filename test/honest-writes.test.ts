@@ -46,16 +46,40 @@ function callSites(src: string): Array<{ line: number; text: string }> {
 
 /**
  * Does this write's filter come from outside?
- * `{ id: args.foo }` / `{ id }` — yes, a caller typed it.
- * `{ id: row.id }` / `{ id: existing[0].id }` — no, it was just read.
+ *
+ * The rule is about SHAPE, not names:
+ *   `{ id: row.id }`, `{ id: existing[0].id }` — a property of something just
+ *      READ. The row is known to exist; these cannot miss.
+ *   `{ id: memory_id }`, `{ id: args.foo }`, `{ id }` — a bare variable or an
+ *      argument. Nothing here proves a row exists.
+ *
+ * The first version of this test only matched `args.`-prefixed and bare `{ id }`,
+ * and therefore missed `/api/memory/salience`, whose filter is a plain
+ * `memory_id` destructured from readJson(). Codex found that endpoint on
+ * 2026-08-21 — the test written to prevent the class had a hole the exact size
+ * of the next instance.
+ *
+ * Flagging is the safe direction: a false positive costs one `{ requireMatch:
+ * true }`, a false negative costs a silent write.
  */
 function takesCallerId(text: string): boolean {
-  const filter = text.match(/\{\s*id\s*(:[^}]*)?\}/);
+  const filter = text.match(/\{\s*id\s*(:[^},]*)?\s*[},]/);
   if (!filter) return false;
   const body = filter[0];
-  if (/\bid\s*:\s*(args|body|params|input)\./.test(body)) return true;
-  if (/^\{\s*id\s*\}$/.test(body.replace(/\s+/g, ' ').trim())) return true;
-  return false;
+
+  // `{ id }` shorthand — the variable is named id and came from somewhere else.
+  if (/\{\s*id\s*[},]/.test(body)) return true;
+
+  const value = body.match(/id\s*:\s*([^},]+)/)?.[1]?.trim();
+  if (!value) return false;
+
+  // A property access on a local object — `row.id`, `existing[0].id`, `p.id`.
+  // Those are reads. Explicit caller namespaces are NOT reads.
+  if (/^(args|body|params|input)\b/.test(value)) return true;
+  if (/[.\[]/.test(value)) return false;
+
+  // A bare identifier: `memory_id`, `entry_id`, `skill_id`. Not provably a read.
+  return /^[A-Za-z_$][\w$]*$/.test(value);
 }
 
 describe('writes that take a caller-supplied id must verify a row matched', () => {
