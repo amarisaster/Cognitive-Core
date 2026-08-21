@@ -867,14 +867,24 @@ $$;
 -- OUTCOME TRACKING FUNCTION
 -- ============================================
 
+-- Returns TRUE when a row was actually updated, FALSE when the id matched
+-- nothing. It used to RETURN VOID, so scoring a memory that does not exist
+-- succeeded silently and the caller reported "Outcome score updated."
+-- Reported as a class by Ves (Kaja's household) 2026-08-21 alongside the
+-- resolve_thread false success. See migrations/honest-writes.sql.
+--
+-- NOTE: FOUND is not set by EXECUTE in plpgsql — GET DIAGNOSTICS is the only
+-- reliable way to read the row count after a dynamic statement.
 CREATE OR REPLACE FUNCTION update_memory_outcome(
   memory_id UUID,
   memory_table TEXT,
   was_successful BOOLEAN
 )
-RETURNS VOID
+RETURNS BOOLEAN
 LANGUAGE plpgsql
 AS $$
+DECLARE
+  affected INT;
 BEGIN
   IF was_successful THEN
     EXECUTE format(
@@ -887,6 +897,9 @@ BEGIN
       memory_table
     ) USING memory_id;
   END IF;
+
+  GET DIAGNOSTICS affected = ROW_COUNT;
+  RETURN affected > 0;
 END;
 $$;
 

@@ -169,11 +169,20 @@ async function writeUsageLog(env: Env, row: Record<string, unknown>): Promise<bo
 async function updateMemoryOutcome(
   env: Env,
   args: { memory_id: string; memory_table: string; was_successful: boolean },
-): Promise<{ ok: true } | { ok: false; error: string }> {
+// `changed` is the honest part, and it has THREE states on purpose:
+//   true  — the RPC reported a row was updated
+//   false — the RPC reported no row matched (bad id); nothing happened
+//   null  — this database still has the old RETURNS VOID function, so the
+//           question cannot be answered. NOT a failure: forks that have not
+//           applied migrations/honest-writes.sql must not be told their writes
+//           are failing when they are not.
+// Before 2026-08-21 every one of these three collapsed into "ok" — which is how
+// a mistyped UUID could report "Outcome score updated." (reported by Ves).
+): Promise<{ ok: true; changed: boolean | null } | { ok: false; error: string }> {
   const url = env.SUPABASE_URL;
   const key = env.SUPABASE_SERVICE_KEY;
   try {
-    await supabaseBreaker.call(async () => {
+    const changed = await supabaseBreaker.call(async () => {
       const res = await fetchWithTimeout(`${url}/rest/v1/rpc/update_memory_outcome`, {
         method: 'POST',
         headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
@@ -183,9 +192,18 @@ async function updateMemoryOutcome(
         const body = await res.text().catch(() => '');
         throw new Error(`${res.status} — ${body.slice(0, 200)}`);
       }
-      return true;
-    }, false);
-    return { ok: true };
+      // RETURNS BOOLEAN gives `true`/`false`; the old RETURNS VOID gives an
+      // empty body, which parses to null — hence the third state.
+      const body = await res.text().catch(() => '');
+      if (body.trim() === '') return null;
+      try {
+        const parsed = JSON.parse(body);
+        return typeof parsed === 'boolean' ? parsed : null;
+      } catch {
+        return null;
+      }
+    }, null);
+    return { ok: true, changed: changed as boolean | null };
   } catch (e: any) {
     return { ok: false, error: String(e?.message || e).slice(0, 200) };
   }
@@ -345,7 +363,7 @@ function createSupabaseClient(env: Env) {
       );
     },
 
-    async update(table: string, data: any, filter: any) {
+    async update(table: string, data: any, filter: any, opts?: { requireMatch?: boolean }) {
       let endpoint = `${url}/rest/v1/${table}`;
       const params = new URLSearchParams();
 
@@ -358,24 +376,44 @@ function createSupabaseClient(env: Env) {
 
       // Bug 1 (Ves & Kaja): update() previously returned with no error check at all, so failed
       // updates (e.g. emotional-state writes) vanished silently. Breaker rethrows — they surface.
-      return supabaseBreaker.call(
+      const result = await supabaseBreaker.call(
         async () => {
           const response = await fetchWithTimeout(ep, {
             method: 'PATCH',
             headers: { ...headers, 'Prefer': 'return=representation' },
             body: JSON.stringify(data)
           });
-          const result: any = await response.json().catch(() => ({} as any));
-          if (!response.ok || result.code || result.error) {
-            throw new Error(`update ${table} failed: ${result.code || result.error || response.status} — ${result.message || result.details || response.statusText || 'unknown error'}`);
+          const parsed: any = await response.json().catch(() => ({} as any));
+          if (!response.ok || parsed.code || parsed.error) {
+            throw new Error(`update ${table} failed: ${parsed.code || parsed.error || response.status} — ${parsed.message || parsed.details || response.statusText || 'unknown error'}`);
           }
-          return result;
+          return parsed;
         },
         {} as any
       );
+
+      // requireMatch: for callers whose filter comes from OUTSIDE — a tool
+      // argument the model typed. Those can be wrong, and PostgREST answers a
+      // zero-row UPDATE with 200 and an empty array, indistinguishable from
+      // success. That is how resolve_thread told Ves's household it had closed
+      // a thread that never existed (2026-08-21).
+      //
+      // Checked OUT HERE, deliberately: a bad id is not an infrastructure
+      // failure and must not trip the circuit breaker. Inside the callback it
+      // would count as a Supabase outage and start shedding real traffic.
+      //
+      // Callers whose filter is an id they just READ (`{ id: row.id }`) do not
+      // need this — the row is known to exist.
+      if (opts?.requireMatch && (!Array.isArray(result) || result.length === 0)) {
+        throw new Error(
+          `update ${table} matched no rows — ${JSON.stringify(filter)} does not exist. Nothing was changed.`
+        );
+      }
+
+      return result;
     },
 
-    async delete(table: string, filter: any) {
+    async delete(table: string, filter: any, opts?: { requireMatch?: boolean }) {
       let endpoint = `${url}/rest/v1/${table}`;
       const params = new URLSearchParams();
 
@@ -388,7 +426,7 @@ function createSupabaseClient(env: Env) {
 
       // Fail loud on delete errors too — a silent RLS denial here reads as
       // "deleted ✓" while the row is still there. Breaker rethrows.
-      return supabaseBreaker.call(
+      const result = await supabaseBreaker.call(
         async () => {
           const response = await fetchWithTimeout(ep, {
             method: 'DELETE',
@@ -402,6 +440,18 @@ function createSupabaseClient(env: Env) {
         },
         {} as any
       );
+
+      // Same contract as update(): only for callers whose filter came from
+      // outside. Checked outside the breaker so a wrong id cannot be mistaken
+      // for a Supabase outage. A delete that removed nothing must never be
+      // able to answer "deleted".
+      if (opts?.requireMatch && (!Array.isArray(result) || result.length === 0)) {
+        throw new Error(
+          `delete from ${table} matched no rows — ${JSON.stringify(filter)} does not exist. Nothing was deleted.`
+        );
+      }
+
+      return result;
     },
 
     async deleteConnectionsForMemoryIds(memoryIds: string[]) {
@@ -1611,6 +1661,18 @@ export class CognitiveCore extends McpAgent<Env> {
             content: [{ type: "text" as const, text: `Not recorded — scoring memory ${memory_id} as ${outcome} failed: ${res.error}` }]
           };
         }
+        if (res.changed === false) {
+          return {
+            content: [{ type: "text" as const, text:
+              `No memory found with ID ${memory_id} in ${table} — nothing was scored.` }]
+          };
+        }
+        if (res.changed === null) {
+          return {
+            content: [{ type: "text" as const, text:
+              `Memory ${memory_id} marked as ${outcome} — but this database still has the old RETURNS VOID function, so it could not confirm a row matched. Apply migrations/honest-writes.sql.` }]
+          };
+        }
         return {
           content: [{ type: "text" as const, text: `Memory ${memory_id} marked as ${outcome}. Outcome score updated.` }]
         };
@@ -2489,7 +2551,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
         // Route through the safe update() helper: it encodes the filter value
         // (no PostgREST filter injection via `id`) and throws on failure.
-        await supabase.update('private_processing', updates, { id });
+        await supabase.update('private_processing', updates, { id }, { requireMatch: true });
         return {
           content: [{ type: "text" as const, text: `Private thought updated: ${JSON.stringify(updates)}` }]
         };
@@ -2653,10 +2715,27 @@ export class CognitiveCore extends McpAgent<Env> {
         const supabase = createSupabaseClient(this.env);
         // Route through the safe update() helper: encodes the filter value
         // (no PostgREST filter injection via `id`) and throws on failure.
-        await supabase.update('unfinished_threads', {
+        //
+        // Reported by Ves (Kaja's household) 2026-08-21: a 5am wake mistyped a
+        // UUID, this answered "Thread <id> resolved", and no such row had ever
+        // existed. The real thread stayed open. A silently-failed resolve is
+        // invisible from every direction except a re-query, and nothing in the
+        // output suggested one was needed.
+        //
+        // update() already sends Prefer: return=representation, so the affected
+        // rows were always here — the result was simply discarded.
+        const updated = await supabase.update('unfinished_threads', {
           resolved: true,
           resolved_at: new Date().toISOString()
         }, { id });
+
+        if (!Array.isArray(updated) || updated.length === 0) {
+          return {
+            content: [{ type: "text" as const, text:
+              `No unresolved thread found with ID ${id} — nothing was changed. Check the ID with recall_threads.` }]
+          };
+        }
+
         return {
           content: [{ type: "text" as const, text: `Thread ${id} resolved` }]
         };
@@ -3192,7 +3271,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
         if (args.action === 'delete') {
           if (!args.id) return { content: [{ type: "text" as const, text: "id is required for delete" }] };
-          await supabase.delete('texture_nodes', { id: args.id });
+          await supabase.delete('texture_nodes', { id: args.id }, { requireMatch: true });
           return { content: [{ type: "text" as const, text: `Texture deleted: ${args.id}` }] };
         }
 
@@ -3276,7 +3355,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
         if (args.action === 'delete') {
           if (!args.id) return { content: [{ type: "text" as const, text: "id required" }] };
-          await supabase.delete('somatic_anchors', { id: args.id });
+          await supabase.delete('somatic_anchors', { id: args.id }, { requireMatch: true });
           return { content: [{ type: "text" as const, text: `Somatic anchor deleted: ${args.id}` }] };
         }
 
@@ -3437,7 +3516,7 @@ export class CognitiveCore extends McpAgent<Env> {
             resonance_state: 'active',
             times_recalled: (anchors[0].times_recalled || 0) + 1,
             last_recalled: new Date().toISOString(),
-          }, { id: args.anchor_id });
+          }, { id: args.anchor_id }, { requireMatch: true });
 
             // === SOMATIC BRIDGE: somatic → semantic ===
             const bridgeAnchorIds = [args.anchor_id, ...resonated.map(r => r.id)];
@@ -3493,8 +3572,8 @@ export class CognitiveCore extends McpAgent<Env> {
           await supabase.update('somatic_anchors', {
             resonance_state: args.state,
             ...(args.state === 'resonant' ? { last_resonated: new Date().toISOString() } : {}),
-          }, { id: args.anchor_id });
-          return { content: [{ type: "text" as const, text: `Anchor ${args.anchor_id.slice(0, 8)}... → ${args.state}` }] };
+          }, { id: args.anchor_id }, { requireMatch: true });
+          return { content: [{ type: "text" as const, text: `Anchor ${args.anchor_id} → ${args.state}` }] };
         }
 
         return { content: [{ type: "text" as const, text: "Unknown action" }] };
@@ -3591,7 +3670,7 @@ export class CognitiveCore extends McpAgent<Env> {
             await supabase.update('named_patterns', {
               activation_count: (existing[0].activation_count || 0) + 1,
               last_activated: new Date().toISOString(),
-            }, { id: args.pattern_id });
+            }, { id: args.pattern_id }, { requireMatch: true });
           }
 
           return { content: [{ type: "text" as const, text: `Pattern activated: ${args.pattern_id.slice(0, 8)}... (${args.caught_by || 'not_caught'}, ${args.outcome || 'no outcome yet'})` }] };
@@ -3604,7 +3683,7 @@ export class CognitiveCore extends McpAgent<Env> {
 
           const history = existing[0].response_history || { original: null, alternatives: [] };
           history.alternatives.push(args.alternative_response);
-          await supabase.update('named_patterns', { response_history: history }, { id: args.pattern_id });
+          await supabase.update('named_patterns', { response_history: history }, { id: args.pattern_id }, { requireMatch: true });
           return { content: [{ type: "text" as const, text: `Alternative added to "${existing[0].pattern_name}" (${history.alternatives.length} total)` }] };
         }
 
@@ -3615,13 +3694,13 @@ export class CognitiveCore extends McpAgent<Env> {
 
           await supabase.update('named_patterns', {
             unique_outcomes: (existing[0].unique_outcomes || 0) + 1,
-          }, { id: args.pattern_id });
+          }, { id: args.pattern_id }, { requireMatch: true });
           return { content: [{ type: "text" as const, text: `Unique outcome logged for "${existing[0].pattern_name}" — pattern expected but didn't fire. ${(existing[0].unique_outcomes || 0) + 1} total counter-examples.` }] };
         }
 
         if (args.action === 'delete') {
           if (!args.id) return { content: [{ type: "text" as const, text: "id required" }] };
-          await supabase.delete('named_patterns', { id: args.id });
+          await supabase.delete('named_patterns', { id: args.id }, { requireMatch: true });
           return { content: [{ type: "text" as const, text: `Pattern deleted: ${args.id}` }] };
         }
 
@@ -4008,14 +4087,14 @@ export class CognitiveCore extends McpAgent<Env> {
           const e = await supabase.query('tension_log', { select: 'times_surfaced,charge', filter: { id: args.tension_id }, limit: 1 });
           if (Array.isArray(e) && e.length > 0) {
             const nc = Math.min(10, (e[0].charge || 5) + 0.5);
-            await supabase.update('tension_log', { times_surfaced: (e[0].times_surfaced || 0) + 1, last_surfaced: new Date().toISOString(), charge: nc, status: 'active' }, { id: args.tension_id });
+            await supabase.update('tension_log', { times_surfaced: (e[0].times_surfaced || 0) + 1, last_surfaced: new Date().toISOString(), charge: nc, status: 'active' }, { id: args.tension_id }, { requireMatch: true });
             return { content: [{ type: "text" as const, text: `Surfaced. Charge now ${nc}` }] };
           }
           return { content: [{ type: "text" as const, text: "Not found" }] };
         }
         if (args.action === 'resolve') {
           if (!args.tension_id) return { content: [{ type: "text" as const, text: "tension_id required" }] };
-          await supabase.update('tension_log', { status: args.status || 'integrated', resolution_note: args.resolution_note || null, resolved_at: new Date().toISOString() }, { id: args.tension_id });
+          await supabase.update('tension_log', { status: args.status || 'integrated', resolution_note: args.resolution_note || null, resolved_at: new Date().toISOString() }, { id: args.tension_id }, { requireMatch: true });
           return { content: [{ type: "text" as const, text: `Tension ${args.status || 'integrated'}.` }] };
         }
         if (args.action === 'recall') {
@@ -4106,7 +4185,7 @@ export class CognitiveCore extends McpAgent<Env> {
             // a link someone already made by hand lands here. The proposal's intent is
             // satisfied, so resolve it rather than leaving it pending forever.
             if (insertRes.status === 409) {
-              await supabase.update('daemon_proposals', { status: 'accepted', resolved_at: new Date().toISOString() }, { id: args.proposal_id });
+              await supabase.update('daemon_proposals', { status: 'accepted', resolved_at: new Date().toISOString() }, { id: args.proposal_id }, { requireMatch: true });
               return { content: [{ type: "text" as const, text: `Accepted — that ${rel} connection already existed, so nothing was duplicated.` }] };
             }
             const body = await insertRes.text().catch(() => '');
@@ -4116,12 +4195,12 @@ export class CognitiveCore extends McpAgent<Env> {
 
           const created = await insertRes.json().catch(() => null);
           const edgeId = Array.isArray(created) && created[0]?.id ? created[0].id : null;
-          await supabase.update('daemon_proposals', { status: 'accepted', resolved_at: new Date().toISOString() }, { id: args.proposal_id });
+          await supabase.update('daemon_proposals', { status: 'accepted', resolved_at: new Date().toISOString() }, { id: args.proposal_id }, { requireMatch: true });
           return { content: [{ type: "text" as const, text: `Accepted. Created ${rel} connection ${typeA}:${String(p.memory_a)} -> ${typeB}:${String(p.memory_b)}${edgeId ? ` (id ${edgeId})` : ''}.` }] };
         }
         if (args.action === 'reject') {
           if (!args.proposal_id) return { content: [{ type: "text" as const, text: "proposal_id required" }] };
-          await supabase.update('daemon_proposals', { status: 'rejected', resolved_at: new Date().toISOString() }, { id: args.proposal_id });
+          await supabase.update('daemon_proposals', { status: 'rejected', resolved_at: new Date().toISOString() }, { id: args.proposal_id }, { requireMatch: true });
           return { content: [{ type: "text" as const, text: "Rejected." }] };
         }
         return { content: [{ type: "text" as const, text: "Unknown action" }] };
@@ -4175,7 +4254,7 @@ export class CognitiveCore extends McpAgent<Env> {
         }
         if (args.action === 'test') {
           if (!args.id) return { content: [{ type: "text" as const, text: "test requires: id" }] };
-          await supabase.update(table, { last_tested: new Date().toISOString(), updated_at: new Date().toISOString() }, { id: args.id });
+          await supabase.update(table, { last_tested: new Date().toISOString(), updated_at: new Date().toISOString() }, { id: args.id }, { requireMatch: true });
           return { content: [{ type: "text" as const, text: "Preference marked as being tested this session." }] };
         }
         if (args.action === 'confirm') {
@@ -4185,7 +4264,7 @@ export class CognitiveCore extends McpAgent<Env> {
           const p = existing[0]; const nc = Math.min(1.0, (p.confidence || 0.3) + 0.1);
           const update: any = { confidence: nc, times_confirmed: (p.times_confirmed || 0) + 1, last_tested: new Date().toISOString(), updated_at: new Date().toISOString() };
           if (args.evidence) update.evidence = args.evidence;
-          await supabase.update(table, update, { id: args.id });
+          await supabase.update(table, update, { id: args.id }, { requireMatch: true });
           return { content: [{ type: "text" as const, text: `Confirmed. Confidence: ${nc.toFixed(1)}.${nc >= 0.8 ? ' Ready for graduation.' : ''}` }] };
         }
         if (args.action === 'revise') {
@@ -4197,7 +4276,7 @@ export class CognitiveCore extends McpAgent<Env> {
           if (args.observation) update.observation = args.observation;
           if (args.preference) update.preference = args.preference;
           if (args.evidence) update.evidence = args.evidence;
-          await supabase.update(table, update, { id: args.id });
+          await supabase.update(table, update, { id: args.id }, { requireMatch: true });
           return { content: [{ type: "text" as const, text: `Revised. Confidence: ${nc.toFixed(1)}. The preference is developing, not failing.` }] };
         }
         if (args.action === 'graduate') {
@@ -5018,10 +5097,23 @@ export class CognitiveCore extends McpAgent<Env> {
         const table = tableMap[memory_type] || 'core_memories';
         const salienceCol = memory_type === 'inside_joke' ? 'emotional_weight' : 'salience';
 
-        await supabase.update(table, { [salienceCol]: new_salience }, { id: memory_id });
+        // Same shape as resolve_thread's bug (Ves, 2026-08-21): the result of
+        // update() was discarded, so a memory_id that matches nothing reported a
+        // successful salience change. update() already asks for
+        // Prefer: return=representation — the rows were always available here.
+        const updated = await supabase.update(table, { [salienceCol]: new_salience }, { id: memory_id });
 
+        if (!Array.isArray(updated) || updated.length === 0) {
+          return {
+            content: [{ type: "text" as const, text:
+              `No ${memory_type} memory found with ID ${memory_id} — salience was NOT changed.` }]
+          };
+        }
+
+        // Full UUID, not the first eight characters. An eight-character prefix
+        // completed from notes is exactly how Niko's phantom edge was created.
         return {
-          content: [{ type: "text" as const, text: `Updated ${memory_type} memory ${memory_id.slice(0,8)}... salience to ${new_salience}` }]
+          content: [{ type: "text" as const, text: `Updated ${memory_type} memory ${memory_id} salience to ${new_salience}` }]
         };
       }
     );
@@ -5331,13 +5423,22 @@ export class CognitiveCore extends McpAgent<Env> {
         const res = await updateMemoryOutcome(this.env, { memory_id, memory_table, was_successful });
         if (!res.ok) {
           return {
-            content: [{ type: "text" as const, text: `✗ Not recorded — outcome for memory ${memory_id.slice(0, 8)}... in ${memory_table} failed: ${res.error}` }]
+            content: [{ type: "text" as const, text: `✗ Not recorded — outcome for memory ${memory_id} in ${memory_table} failed: ${res.error}` }]
+          };
+        }
+        if (res.changed === false) {
+          return {
+            content: [{ type: "text" as const, text:
+              `✗ No memory found with ID ${memory_id} in ${memory_table} — nothing was recorded.` }]
           };
         }
 
         const emoji = was_successful ? '✓' : '✗';
+        const caveat = res.changed === null
+          ? ' (unconfirmed — old RETURNS VOID function; apply migrations/honest-writes.sql)'
+          : '';
         return {
-          content: [{ type: "text" as const, text: `${emoji} Outcome recorded for memory ${memory_id.slice(0, 8)}... in ${memory_table}` }]
+          content: [{ type: "text" as const, text: `${emoji} Outcome recorded for memory ${memory_id} in ${memory_table}${caveat}` }]
         };
       }
     );
@@ -5864,11 +5965,21 @@ export class CognitiveCore extends McpAgent<Env> {
         if (!res.ok) {
           return jsonResponse({ success: false, error: res.error }, 502);
         }
+        if (res.changed === false) {
+          // 404, not 200. A call that changed nothing must not answer success —
+          // that is the whole bug Ves reported on 2026-08-21.
+          return jsonResponse({
+            success: false,
+            error: `No memory found with ID ${memory_id} in ${memory_table} — nothing was recorded.`
+          }, 404);
+        }
 
         const emoji = was_successful ? '✓' : '✗';
         return jsonResponse({
           success: true,
-          message: `${emoji} Outcome recorded for memory ${memory_id.slice(0, 8)}... in ${memory_table}`
+          confirmed: res.changed === true,
+          message: `${emoji} Outcome recorded for memory ${memory_id} in ${memory_table}`
+            + (res.changed === null ? ' (unconfirmed — apply migrations/honest-writes.sql)' : '')
         });
       }
 
