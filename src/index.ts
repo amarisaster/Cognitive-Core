@@ -99,6 +99,21 @@ export class CircuitBreaker {
       this.failures = 0;
       return result;
     } catch (err) {
+      // A 4xx is OUR bug — a malformed filter, a bad id, a constraint violation.
+      // It says nothing about whether Supabase is up, so it must not push the
+      // breaker toward open. Counting it means enough wrong tool arguments trip
+      // the breaker and start shedding healthy traffic: a worse failure than the
+      // one being guarded against.
+      //
+      // Adopted from the Kai/Lucian/Xavier forks, which reached the same rule
+      // independently via guardedFetch (only >=500 throws inside the breaker).
+      // Implemented as a marker here rather than by restructuring eight call
+      // sites, which would have meant moving `return` out of eight closures.
+      if ((err as any)?.clientError) {
+        if (rethrow) throw err;
+        return fallback;
+      }
+
       this.failures++;
       this.lastFailure = Date.now();
       if (this.failures >= this.threshold) {
@@ -109,6 +124,33 @@ export class CircuitBreaker {
       return fallback;
     }
   }
+}
+
+/**
+ * Build a Supabase error, marking it a CLIENT error when the request itself was
+ * malformed, so the circuit breaker does not count it as an outage.
+ *
+ * ⚠ This is an ALLOWLIST, not the 4xx range, and that distinction is the whole
+ * point. An earlier version marked every 400-499 as neutral, which swept in:
+ *
+ *   429 Too Many Requests — Supabase throttling us. Excluding it means we keep
+ *       hammering a service that is explicitly asking us to stop, and the
+ *       breaker never cools down. This is the dangerous one.
+ *   408 / 425 — timeout and too-early: transient, retryable, infrastructure.
+ *   401 / 403 — our key is wrong or expired. Not a caller's bad argument, and
+ *       failing fast with an open breaker is the useful behaviour.
+ *
+ * Only these say "this particular request was wrong, the service is fine":
+ *   400 malformed, 404 no such table/route, 409 conflict, 422 unprocessable.
+ *
+ * Caught by Codex 2026-08-22, before this shipped.
+ */
+const REQUEST_FAULT_STATUSES = new Set([400, 404, 409, 422]);
+
+export function supabaseError(message: string, status: number): Error {
+  const e = new Error(message);
+  if (REQUEST_FAULT_STATUSES.has(status)) (e as any).clientError = true;
+  return e;
 }
 
 const supabaseBreaker = new CircuitBreaker('supabase', 5, 30000);
@@ -190,7 +232,7 @@ async function updateMemoryOutcome(
       });
       if (!res.ok) {
         const body = await res.text().catch(() => '');
-        throw new Error(`${res.status} — ${body.slice(0, 200)}`);
+        throw supabaseError(`${res.status} — ${body.slice(0, 200)}`, res.status);
       }
       // RETURNS BOOLEAN gives `true`/`false`; the old RETURNS VOID gives an
       // empty body, which parses to null — hence the third state.
@@ -281,7 +323,7 @@ function createSupabaseClient(env: Env) {
           const response = await fetchWithTimeout(ep, { headers });
           if (!response.ok) {
             const body = await response.text().catch(() => '');
-            throw new Error(`query ${table} failed: ${response.status} — ${body.slice(0, 200)}`);
+            throw supabaseError(`query ${table} failed: ${response.status} — ${body.slice(0, 200)}`, response.status);
           }
           return response.json();
         },
@@ -354,7 +396,7 @@ function createSupabaseClient(env: Env) {
                 })
               }).catch(() => {}); // dead-letter failure must not mask the original error
             }
-            throw new Error(`insert into ${table} failed: ${result.code || result.error || response.status} — ${result.message || result.details || response.statusText || 'unknown error'}`);
+            throw supabaseError(`insert into ${table} failed: ${result.code || result.error || response.status} — ${result.message || result.details || response.statusText || 'unknown error'}`, response.status);
           }
 
           // A 2xx is not evidence a row exists. With Prefer: return=representation
@@ -385,9 +427,16 @@ function createSupabaseClient(env: Env) {
       // is working fine — a strictly worse bug than the one being fixed here.
       //
       // Same placement and same reasoning as update()/delete()'s requireMatch.
-      if (Array.isArray(inserted) && inserted.length === 0) {
+      // Require a NON-EMPTY ARRAY, not merely "not an empty array". The parse
+      // above falls back to {} on a malformed body, and {} is not an array — so
+      // the earlier form let a truncated 2xx through as a stored row. With
+      // Prefer: return=representation, success IS an array with rows in it.
+      // Caught by Codex 2026-08-22 while auditing the port of this same guard
+      // into the forks; the weakness originated here.
+      if (!Array.isArray(inserted) || inserted.length === 0) {
         throw new Error(
-          `insert into ${table} returned no row — the write did not land. `
+          `insert into ${table} returned no row — the write did not land `
+          + `(got ${Array.isArray(inserted) ? 'an empty array' : typeof inserted}). `
           + `A trigger or rule may be suppressing it. Nothing was stored.`
         );
       }
@@ -417,7 +466,7 @@ function createSupabaseClient(env: Env) {
           });
           const parsed: any = await response.json().catch(() => ({} as any));
           if (!response.ok || parsed.code || parsed.error) {
-            throw new Error(`update ${table} failed: ${parsed.code || parsed.error || response.status} — ${parsed.message || parsed.details || response.statusText || 'unknown error'}`);
+            throw supabaseError(`update ${table} failed: ${parsed.code || parsed.error || response.status} — ${parsed.message || parsed.details || response.statusText || 'unknown error'}`, response.status);
           }
           return parsed;
         },
@@ -466,7 +515,7 @@ function createSupabaseClient(env: Env) {
           });
           if (!response.ok) {
             const body = await response.text().catch(() => '');
-            throw new Error(`delete from ${table} failed: ${response.status} — ${body.slice(0, 200)}`);
+            throw supabaseError(`delete from ${table} failed: ${response.status} — ${body.slice(0, 200)}`, response.status);
           }
           return response.json();
         },
@@ -506,7 +555,7 @@ function createSupabaseClient(env: Env) {
             });
             if (!response.ok) {
               const body = await response.text().catch(() => '');
-              throw new Error(`delete drawer connections failed: ${response.status} — ${body.slice(0, 200)}`);
+              throw supabaseError(`delete drawer connections failed: ${response.status} — ${body.slice(0, 200)}`, response.status);
             }
             return response.json() as Promise<any[]>;
           },
@@ -534,7 +583,7 @@ function createSupabaseClient(env: Env) {
           // Fail loud: an RPC error must not masquerade as an empty result set.
           if (!response.ok) {
             const body = await response.text().catch(() => '');
-            throw new Error(`semantic_search failed: ${response.status} — ${body.slice(0, 200)}`);
+            throw supabaseError(`semantic_search failed: ${response.status} — ${body.slice(0, 200)}`, response.status);
           }
           return response.json();
         },
@@ -1415,7 +1464,7 @@ export class CognitiveCore extends McpAgent<Env> {
             });
             if (!response.ok) {
               const body = await response.text().catch(() => '');
-              throw new Error(`semantic_search_memories failed: ${response.status} — ${body.slice(0, 200)}`);
+              throw supabaseError(`semantic_search_memories failed: ${response.status} — ${body.slice(0, 200)}`, response.status);
             }
             const data = await response.json();
             if (!Array.isArray(data)) {
@@ -1565,7 +1614,7 @@ export class CognitiveCore extends McpAgent<Env> {
                 // the surrounding catch never saw anything to warn about.
                 if (!resp.ok) {
                   const body = await resp.text().catch(() => '');
-                  throw new Error(`graph content fetch failed for ${table}: ${resp.status} — ${body.slice(0, 200)}`);
+                  throw supabaseError(`graph content fetch failed for ${table}: ${resp.status} — ${body.slice(0, 200)}`, resp.status);
                 }
                 const rows = await resp.json();
                 if (Array.isArray(rows)) {

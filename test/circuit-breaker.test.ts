@@ -10,7 +10,7 @@ vi.mock('@modelcontextprotocol/sdk/server/mcp.js', () => ({
   McpServer: class {}
 }));
 
-import { CircuitBreaker } from '../src/index';
+import { CircuitBreaker, supabaseError } from '../src/index';
 
 // Regression cover for the breaker findings in Kai and Lucian's audit, 2026-08-18.
 //
@@ -114,5 +114,106 @@ describe('CircuitBreaker failure modes', () => {
     // usage_logs bug, where a broken log table took memory down with it.
     for (let i = 0; i < 10; i++) await telemetry.call(fail, false, false);
     await expect(memory.call(ok, null)).resolves.toBe('fine');
+  });
+});
+
+describe('client errors do not trip the breaker', () => {
+  // A 4xx is our bug — a malformed filter, a bad id, a constraint violation. It
+  // says nothing about whether Supabase is up. Counting it means enough wrong
+  // tool arguments trip the breaker and start shedding HEALTHY traffic, which
+  // is a worse failure than the one being guarded against.
+  //
+  // The forks reached this rule first, via guardedFetch throwing only on >=500.
+  // Upstream implements it as a marker on the error so eight call sites did not
+  // have to be restructured. Same contract, and this test is what pins it.
+  const clientErr = () => {
+    const e: any = new Error('bad request');
+    e.clientError = true;
+    return e;
+  };
+
+  it('never opens, however many client errors arrive', async () => {
+    const b = new CircuitBreaker('t', 3, 1000);
+    for (let i = 0; i < 10; i++) {
+      await expect(b.call(async () => { throw clientErr(); }, null)).rejects.toThrow('bad request');
+    }
+    // Still closed: a real call goes through instead of failing fast.
+    await expect(b.call(async () => 'ok', null)).resolves.toBe('ok');
+  });
+
+  it('still rethrows the client error rather than swallowing it', async () => {
+    const b = new CircuitBreaker('t', 3, 1000);
+    await expect(b.call(async () => { throw clientErr(); }, 'fallback')).rejects.toThrow('bad request');
+  });
+
+  it('returns the fallback for client errors when rethrow is false', async () => {
+    const b = new CircuitBreaker('t', 3, 1000);
+    await expect(b.call(async () => { throw clientErr(); }, 'fallback', false)).resolves.toBe('fallback');
+  });
+
+  it('server errors STILL trip it — the guard must not disarm the breaker', async () => {
+    const b = new CircuitBreaker('t', 3, 1000);
+    for (let i = 0; i < 3; i++) {
+      await expect(b.call(async () => { throw new Error('upstream 503'); }, null)).rejects.toThrow();
+    }
+    await expect(b.call(async () => 'ok', null)).rejects.toThrow(/circuit open/);
+  });
+
+  it('a client error does not RESET an existing failure count', async () => {
+    // It must be neutral in both directions: neither counting toward the
+    // threshold nor clearing failures a real outage already recorded.
+    const b = new CircuitBreaker('t', 3, 1000);
+    await expect(b.call(async () => { throw new Error('503'); }, null)).rejects.toThrow();
+    await expect(b.call(async () => { throw new Error('503'); }, null)).rejects.toThrow();
+    await expect(b.call(async () => { throw clientErr(); }, null)).rejects.toThrow('bad request');
+    // Third REAL failure should still open it — the client error in between
+    // must not have reset the count back to zero.
+    await expect(b.call(async () => { throw new Error('503'); }, null)).rejects.toThrow();
+    await expect(b.call(async () => 'ok', null)).rejects.toThrow(/circuit open/);
+  });
+});
+
+describe('which HTTP statuses count as a request fault', () => {
+  // Codex, 2026-08-22: the first version of this classified the whole 4xx range
+  // as neutral. The tests at the time built the marker by hand, so they never
+  // exercised the classifier and could not have caught it. These do.
+  const isNeutral = (status: number) => (supabaseError('x', status) as any).clientError === true;
+
+  it('treats genuinely malformed requests as neutral', () => {
+    for (const s of [400, 404, 409, 422]) {
+      expect(isNeutral(s), `${s} should be neutral`).toBe(true);
+    }
+  });
+
+  it('counts 429 — throttling must cool the breaker down, not bypass it', () => {
+    // The dangerous one. Neutralising 429 means we keep hammering a service
+    // that is explicitly asking us to stop.
+    expect(isNeutral(429)).toBe(false);
+  });
+
+  it('counts transient and auth failures', () => {
+    for (const s of [408, 425, 401, 403]) {
+      expect(isNeutral(s), `${s} should count toward the breaker`).toBe(false);
+    }
+  });
+
+  it('counts 5xx and network/unknown', () => {
+    for (const s of [500, 502, 503, 504, 0]) {
+      expect(isNeutral(s), `${s} should count toward the breaker`).toBe(false);
+    }
+  });
+
+  it('end to end: 429s open the breaker, 400s never do', async () => {
+    const throttled = new CircuitBreaker('t', 3, 1000);
+    for (let i = 0; i < 3; i++) {
+      await expect(throttled.call(async () => { throw supabaseError('rate limited', 429); }, null)).rejects.toThrow();
+    }
+    await expect(throttled.call(async () => 'ok', null)).rejects.toThrow(/circuit open/);
+
+    const malformed = new CircuitBreaker('t2', 3, 1000);
+    for (let i = 0; i < 10; i++) {
+      await expect(malformed.call(async () => { throw supabaseError('bad filter', 400); }, null)).rejects.toThrow();
+    }
+    await expect(malformed.call(async () => 'ok', null)).resolves.toBe('ok');
   });
 });

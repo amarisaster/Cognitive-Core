@@ -143,3 +143,32 @@ describe('writes that take a caller-supplied id must verify a row matched', () =
     expect(guarded.length).toBeGreaterThanOrEqual(10);
   });
 });
+
+describe('the insert guard requires a non-empty array', () => {
+  // `Array.isArray(x) && x.length === 0` looks equivalent to
+  // `!Array.isArray(x) || x.length === 0` and is not. The parse falls back to
+  // {} on a malformed body, and {} is not an array — so the first form treats a
+  // truncated 2xx as a stored row. Both this repo and all three forks had it.
+  // Caught by Codex 2026-08-22.
+  it('never uses the permissive Array.isArray(x) && length===0 form', () => {
+    const src = readFileSync(join(__dirname, '..', 'src', 'index.ts'), 'utf8');
+    // Built with RegExp + String.raw, NOT a literal written through a script.
+    // The first version of this line was generated via a heredoc and its \1
+    // backreference was swallowed as an octal escape, leaving an invisible
+    // control character — so this guard matched nothing and passed while the
+    // permissive form sat right there in the source. Third variant of the
+    // escape-eating family today; see feedback_replace_eats_dollars.
+    const permissive = [...src.matchAll(
+      new RegExp(String.raw`Array\.isArray\((\w+)\)\s*&&\s*\1\.length === 0`, 'g')
+    )];
+    expect(
+      permissive.map(m => m[0]),
+      'use !Array.isArray(x) || x.length === 0 so a non-array body is rejected too',
+    ).toEqual([]);
+  });
+
+  it('the insert path checks for a non-empty representation', () => {
+    const src = readFileSync(join(__dirname, '..', 'src', 'index.ts'), 'utf8');
+    expect(src).toMatch(/!Array\.isArray\(inserted\)\s*\|\|\s*inserted\.length === 0/);
+  });
+});
