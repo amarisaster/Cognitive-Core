@@ -1830,7 +1830,28 @@ export class CognitiveCore extends McpAgent<Env> {
       "delete_entry",
       "Delete any entry by table name and ID - works for essence, people, memories, etc.",
       {
-        table: z.enum(['essence', 'people', 'core_memories', 'patterns', 'session_logs', 'memory_connections']).describe("Table to delete from"),
+        // Eleven tables held authored content with NO delete path of any kind —
+        // you could write to them forever and never remove anything. Reported by
+        // Ves, 2026-08-21; closed 2026-08-22 by widening this allowlist rather
+        // than adding eleven near-identical tools.
+        //
+        // daemon_proposals and tension_log also have RESOLVE flows, and resolving
+        // is not deleting: a resolved tension is history worth keeping, while a
+        // proposal that should never have been made is not. Both are offered
+        // here deliberately — the distinction is the caller's to make, and the
+        // absence of a delete forced one answer onto both.
+        // ⚠ somatic_connections is deliberately NOT here. Its primary key is
+        // SERIAL (integer), and entry_id below validates as a UUID — so listing
+        // it would advertise a delete that can never pass validation. A tool
+        // that offers something it cannot do is the same defect class this
+        // whole list exists to close, so it stays off until it gets a path that
+        // takes an integer id.
+        table: z.enum([
+          'essence', 'people', 'core_memories', 'patterns', 'session_logs', 'memory_connections',
+          'daemon_proposals', 'fantasy_space', 'important_dates', 'memory_anchors',
+          'private_processing', 'reflections', 'rituals', 'skills',
+          'tension_log', 'unfinished_threads',
+        ]).describe("Table to delete from"),
         entry_id: z.string().uuid().describe("UUID of the entry to delete")
       },
       async ({ table, entry_id }) => {
