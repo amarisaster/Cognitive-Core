@@ -56,6 +56,20 @@ async function generateEmbedding(text: string, hfToken: string, ai?: any): Promi
 }
 
 // Circuit breaker — trips after repeated failures, fails fast during cooldown
+// Columns the brain-graph mapper actually reads. Shared by all seven memory
+// tables; anything outside this list — above all `embedding` — is pure egress.
+const BRAIN_NODE_COLS = 'id,content,memory_type,salience,emotional_tag,access_count,created_at,last_accessed';
+// Per-type legacy content columns, kept because older rows may have the legacy
+// column populated and `content` null.
+const BRAIN_EXTRA_COLS: Record<string, string> = {
+  pattern: ',description',
+  sensory: ',detail',
+  growth: ',observation',
+  anticipation: ',what',
+  inside_joke: ',reference,emotional_weight',
+  friction: ',what_happened',
+};
+
 export class CircuitBreaker {
   private failures = 0;
   private lastFailure = 0;
@@ -6958,7 +6972,19 @@ export class CognitiveCore extends McpAgent<Env> {
           const results = await Promise.all(
             tables.map(([type, table]) =>
               supabase.query(table, {
-                select: '*',
+                // NOT select:'*'. That pulled the embedding column — vector(1024),
+                // ~12,795 BYTES ON THE WIRE per row against ~126 bytes of actual
+                // content, a 101x ratio — and the mapper below discards it.
+                // This endpoint is polled every 5 SECONDS by the brain view, over
+                // 7 tables, so it moved roughly 1 MB per poll for data it never
+                // reads: enough to exhaust a 5 GB egress quota in under 7 hours.
+                //
+                // These nine columns exist on ALL seven memory tables (verified
+                // against information_schema); BRAIN_EXTRA_COLS adds the per-type
+                // legacy content column the mapper falls back to. Requesting a
+                // column a table does not have makes PostgREST return 400, which
+                // is why this is a per-type list and not one union.
+                select: BRAIN_NODE_COLS + (BRAIN_EXTRA_COLS[type] || ''),
                 order: 'salience.desc',
                 limit: perTable
               }).then((rows: any) => (Array.isArray(rows) ? rows : []).map((r: any) => ({
