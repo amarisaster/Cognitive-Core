@@ -51,25 +51,39 @@ describe('migration files are structurally runnable', () => {
       const sql = sanitize(readFileSync(join(DIR, file), 'utf8'));
       const lines = sql.split(/\r?\n/);
 
+      // Postgres accepts BOTH $$ and a named tag like $guard$. Treating only
+      // $$ as valid made this test reject correct SQL, which is the failure
+      // mode that gets a guard deleted rather than fixed. Delimiters are
+      // tokenised properly now: $ + optional identifier + $.
+      const DELIM = /\$[A-Za-z_][A-Za-z_0-9]*\$|\$\$/g;
+
       it('has no lone-$ dollar-quote delimiters', () => {
-        // A `$` that is not part of a `$$` pair. This is the exact defect:
-        // `DO $` and `END $;` instead of `DO $$` / `END $$;`.
+        // Strip every WELL-FORMED delimiter; whatever $ survives is the defect.
+        // This is the String.replace corruption: $$ silently collapsed to $,
+        // leaving `DO $` / `END $;` that no database will accept.
         const bad: string[] = [];
         lines.forEach((line, i) => {
-          if (/(?<!\$)\$(?!\$)/.test(line)) bad.push(`line ${i + 1}: ${line.trim()}`);
+          if (line.replace(DELIM, '').includes(D)) bad.push(`line ${i + 1}: ${line.trim()}`);
         });
         expect(bad, `lone ${D} delimiter — Postgres rejects the file here`).toEqual([]);
       });
 
-      it('has an even number of $$ delimiters', () => {
-        const count = (sql.match(/\$\$/g) || []).length;
-        expect(count % 2, `${count} ${DD} delimiters — an odd count leaves a block unterminated`).toBe(0);
+      it('closes every dollar-quoted block with its own tag', () => {
+        // Per-tag, not in aggregate. A file opening $$ and closing $guard$ has
+        // an even total and is still unrunnable.
+        const counts = new Map<string, number>();
+        for (const d of sql.match(DELIM) || []) counts.set(d, (counts.get(d) || 0) + 1);
+        const odd = [...counts.entries()].filter(([, n]) => n % 2 !== 0).map(([d, n]) => `${d} x${n}`);
+        expect(odd, 'a dollar-quoted block is left unterminated').toEqual([]);
       });
 
       it('pairs every DO block with an END', () => {
-        const opens = (sql.match(/\bDO\s+\$\$/gi) || []).length;
-        const closes = (sql.match(/\bEND\s+\$\$\s*;/gi) || []).length;
-        expect(closes, `${opens} DO ${DD} blocks but ${closes} END ${DD}; terminators`).toBe(opens);
+        // Tag-aware, and tolerant of `END` on its own line before the tag —
+        // which is how plpgsql is normally formatted and how the lockdown
+        // guard is written.
+        const opens = (sql.match(/\bDO\s+(?:\$[A-Za-z_][A-Za-z_0-9]*\$|\$\$)/gi) || []).length;
+        const closes = (sql.match(/\bEND\s*(?:\$[A-Za-z_][A-Za-z_0-9]*\$|\$\$)\s*;/gi) || []).length;
+        expect(closes, `${opens} DO blocks but ${closes} END-with-delimiter terminators`).toBe(opens);
       });
     });
   }

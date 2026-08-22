@@ -70,8 +70,43 @@ SELECT
 -- Verify rather than assume:
 --   SELECT has_table_privilege('service_role','public.core_memories','SELECT');
 -- If that is false, STOP — this migration will lock out your own brain.
+--
+-- This used to be a comment telling you to check. Ves's household ran the check
+-- AFTER the revoke rather than before, and got the answer they needed in the one
+-- order that could not have saved them: had it been false, they would have
+-- learned it by the brain going dark. A precondition written as prose is a
+-- precondition you are trusting someone not to skip at 11pm.
+--
+-- So it executes now. It runs inside the transaction, before anything is
+-- revoked, and raises, which rolls the whole thing back.
 
 BEGIN;
+
+DO $guard$
+DECLARE
+  probe_table TEXT;
+BEGIN
+  SELECT table_name INTO probe_table
+    FROM information_schema.tables
+   WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+   ORDER BY table_name
+   LIMIT 1;
+
+  IF probe_table IS NULL THEN
+    RAISE EXCEPTION
+      'ABORT: no base tables in schema public. Wrong database, or nothing to lock down.';
+  END IF;
+
+  IF NOT has_table_privilege('service_role', 'public.' || quote_ident(probe_table), 'SELECT') THEN
+    RAISE EXCEPTION
+      'ABORT: service_role holds no SELECT on public.%. The REVOKEs below would lock your own worker out of its brain. service_role bypasses RLS, NOT object privileges - it works only because Supabase granted it explicitly, and on this database that grant is missing. Investigate before running any of this.',
+      probe_table;
+  END IF;
+
+  RAISE NOTICE 'precondition ok: service_role can SELECT public.% - safe to revoke below', probe_table;
+END
+$guard$;
+
 
 REVOKE ALL ON ALL TABLES    IN SCHEMA public FROM anon, authenticated;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM anon, authenticated;
@@ -82,6 +117,23 @@ REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM anon, authenticated;
 -- place. Harmless while every function is SECURITY INVOKER (it runs as the
 -- caller and dies on the caller's missing table grants), but the first
 -- SECURITY DEFINER function added later becomes an open door.
+-- ⚠ MEASURE BEFORE YOU RUN THIS ONE. Section 1 gave you
+-- anon_security_definer_functions. If it is 0, this line and the service_role
+-- GRANT beside it close a door that does not exist yet, and they carry a small
+-- nonzero risk: something Supabase installs in public may be expected to be
+-- PUBLIC-executable. Ves's household measured 0, ran only the
+-- ALTER DEFAULT PRIVILEGES line at the end of this section, and skipped these
+-- two deliberately. That was the right call and it was not the one this file
+-- originally recommended.
+--
+-- The default-privileges line has neither problem - it touches nothing that
+-- exists, so it is safe on any schema and is what actually prevents the door
+-- from appearing. These two are the remediation for a door you already have.
+--
+-- A fix you cannot measure is indistinguishable from a change you do not
+-- understand. If the count is 0, skip to the ALTER DEFAULT PRIVILEGES block and
+-- say so in your notes: prevention-only on the function side, not closed.
+
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;
 GRANT  EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO service_role;
 

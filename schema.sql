@@ -810,56 +810,205 @@ CREATE INDEX idx_metacognition_created ON metacognition_log(created_at DESC);
 
 DROP FUNCTION IF EXISTS semantic_search_memories(vector, double precision, integer, text);
 
-CREATE FUNCTION semantic_search_memories(
-  query_embedding vector(384),
-  match_threshold FLOAT DEFAULT 0.5,
-  match_count INT DEFAULT 10,
-  memory_type_filter TEXT DEFAULT NULL
+-- semantic_search_memories — THE CANONICAL 12-BRANCH SHAPE.
+--
+-- Transcribed from pg_get_functiondef on the live database 2026-08-22, NOT
+-- authored here. Kai, Lucian, Xavier and Auren all run this shape; the worker
+-- reads `row?.similarity || row?.combined_score`, which only this shape
+-- returns. Two earlier versions of this file (2 branches, then 8) described a
+-- function nobody was running, and every fork that deployed from it inherited
+-- a search that could not see most of its own memory.
+--
+-- If you change this, change the deployed function in the same breath and
+-- re-dump it to confirm. See docs/dev-hygiene.md, "The file is not the system".
+-- Existing deployments upgrade via migrations/semantic-recall-canonical.sql.
+CREATE OR REPLACE FUNCTION semantic_search_memories(
+  query_embedding vector,
+  match_threshold real DEFAULT 0.5,
+  match_count integer DEFAULT 10,
+  memory_type_filter text DEFAULT NULL::text
 )
-RETURNS TABLE (
-  id UUID,
-  content TEXT,
-  memory_type TEXT,
-  salience INTEGER,
-  emotional_tag TEXT,
-  similarity FLOAT,
-  outcome_score REAL,
-  drawer_name TEXT
+RETURNS TABLE(
+  id uuid,
+  content text,
+  memory_type text,
+  similarity real,
+  outcome_score real,
+  combined_score real,
+  created_at timestamp with time zone
 )
 LANGUAGE plpgsql
 AS $$
 BEGIN
-  RETURN QUERY
-  SELECT ranked.id, ranked.content, ranked.memory_type, ranked.salience,
-         ranked.emotional_tag, ranked.similarity, ranked.outcome_score,
-         ranked.drawer_name
-  FROM (
-    SELECT
-      m.id, m.content, m.memory_type, m.salience, m.emotional_tag,
-      1 - (m.embedding <=> query_embedding) AS similarity,
-      m.outcome_score, NULL::TEXT AS drawer_name
+    RETURN QUERY
+
+    -- core_memories
+    -- NOTE: emits the LITERAL 'core', not m.memory_type. core's memory_type
+    -- column holds its SUBTYPE (bond_moment, vow, first_time). The deployed
+    -- function has always flattened it here and the worker's type filter is
+    -- built on that. Do not "restore" the subtype without checking callers.
+    -- The aliases on this FIRST branch are load-bearing: a UNION's ORDER BY can
+    -- only reference RESULT COLUMN NAMES, and those come from the first SELECT.
+    -- Dropping them makes `ORDER BY combined_score` fail at CALL time while
+    -- CREATE still succeeds — plpgsql does not plan the body until invoked.
+    -- That exact mistake shipped a broken function to a live database on
+    -- 2026-08-22. Do not "tidy" these away.
+    SELECT m.id, m.content, 'core'::TEXT AS memory_type,
+        (1 - (m.embedding <=> query_embedding))::REAL AS similarity,
+        COALESCE(m.outcome_score, 0)::REAL AS outcome_score,
+        ((0.7 * (1 - (m.embedding <=> query_embedding))) + (0.3 * COALESCE(m.outcome_score, 0) / 10))::REAL AS combined_score,
+        m.created_at
     FROM core_memories m
-    WHERE m.embedding IS NOT NULL
-      AND 1 - (m.embedding <=> query_embedding) > match_threshold
-      AND (memory_type_filter IS NULL OR m.memory_type = memory_type_filter)
+    WHERE m.embedding IS NOT NULL AND COALESCE(m.status, 'active') = 'active'
+      AND (1 - (m.embedding <=> query_embedding)) > match_threshold
+      AND (memory_type_filter IS NULL OR 'core' = memory_type_filter)
 
     UNION ALL
 
-    SELECT
-      m.id, m.content, m.memory_type, m.salience, m.emotional_tag,
-      1 - (m.embedding <=> query_embedding) AS similarity,
-      m.outcome_score, m.drawer_name
-    FROM custom_memories m
-    WHERE m.embedding IS NOT NULL
-      AND 1 - (m.embedding <=> query_embedding) > match_threshold
-      AND (memory_type_filter IS NULL OR memory_type_filter = 'custom' OR m.drawer_name = memory_type_filter)
-  ) ranked
-  ORDER BY
-    ranked.similarity * 0.6 +
-    COALESCE(ranked.outcome_score, 0) * 0.1 +
-    (ranked.salience::float / 10) * 0.3
-  DESC
-  LIMIT match_count;
+    -- patterns
+    SELECT p.id, COALESCE(p.content, p.description), 'pattern'::TEXT,
+        (1 - (p.embedding <=> query_embedding))::REAL,
+        COALESCE(p.outcome_score, 0)::REAL,
+        ((0.7 * (1 - (p.embedding <=> query_embedding))) + (0.3 * COALESCE(p.outcome_score, 0) / 10))::REAL,
+        p.created_at
+    FROM patterns p
+    WHERE p.embedding IS NOT NULL AND COALESCE(p.status, 'active') = 'active'
+      AND (1 - (p.embedding <=> query_embedding)) > match_threshold
+      AND (memory_type_filter IS NULL OR 'pattern' = memory_type_filter)
+
+    UNION ALL
+
+    -- sensory_memories
+    SELECT s.id, COALESCE(s.content, s.detail), 'sensory'::TEXT,
+        (1 - (s.embedding <=> query_embedding))::REAL,
+        COALESCE(s.outcome_score, 0)::REAL,
+        ((0.7 * (1 - (s.embedding <=> query_embedding))) + (0.3 * COALESCE(s.outcome_score, 0) / 10))::REAL,
+        s.created_at
+    FROM sensory_memories s
+    WHERE s.embedding IS NOT NULL AND COALESCE(s.status, 'active') = 'active'
+      AND (1 - (s.embedding <=> query_embedding)) > match_threshold
+      AND (memory_type_filter IS NULL OR 'sensory' = memory_type_filter)
+
+    UNION ALL
+
+    -- growth_markers
+    SELECT g.id, COALESCE(g.content, g.observation), 'growth'::TEXT,
+        (1 - (g.embedding <=> query_embedding))::REAL,
+        COALESCE(g.outcome_score, 0)::REAL,
+        ((0.7 * (1 - (g.embedding <=> query_embedding))) + (0.3 * COALESCE(g.outcome_score, 0) / 10))::REAL,
+        g.created_at
+    FROM growth_markers g
+    WHERE g.embedding IS NOT NULL AND COALESCE(g.status, 'active') = 'active'
+      AND (1 - (g.embedding <=> query_embedding)) > match_threshold
+      AND (memory_type_filter IS NULL OR 'growth' = memory_type_filter)
+
+    UNION ALL
+
+    -- anticipation
+    SELECT a.id, COALESCE(a.content, a.what), 'anticipation'::TEXT,
+        (1 - (a.embedding <=> query_embedding))::REAL,
+        COALESCE(a.outcome_score, 0)::REAL,
+        ((0.7 * (1 - (a.embedding <=> query_embedding))) + (0.3 * COALESCE(a.outcome_score, 0) / 10))::REAL,
+        a.created_at
+    FROM anticipation a
+    WHERE a.embedding IS NOT NULL AND COALESCE(a.status, 'active') = 'active'
+      AND (1 - (a.embedding <=> query_embedding)) > match_threshold
+      AND (memory_type_filter IS NULL OR 'anticipation' = memory_type_filter)
+
+    UNION ALL
+
+    -- inside_jokes
+    SELECT j.id, COALESCE(j.content, j.reference), 'inside_joke'::TEXT,
+        (1 - (j.embedding <=> query_embedding))::REAL,
+        COALESCE(j.outcome_score, 0)::REAL,
+        ((0.7 * (1 - (j.embedding <=> query_embedding))) + (0.3 * COALESCE(j.outcome_score, 0) / 10))::REAL,
+        j.created_at
+    FROM inside_jokes j
+    WHERE j.embedding IS NOT NULL AND COALESCE(j.status, 'active') = 'active'
+      AND (1 - (j.embedding <=> query_embedding)) > match_threshold
+      AND (memory_type_filter IS NULL OR 'inside_joke' = memory_type_filter)
+
+    UNION ALL
+
+    -- friction_log
+    SELECT f.id, COALESCE(f.content, f.what_happened), 'friction'::TEXT,
+        (1 - (f.embedding <=> query_embedding))::REAL,
+        COALESCE(f.outcome_score, 0)::REAL,
+        ((0.7 * (1 - (f.embedding <=> query_embedding))) + (0.3 * COALESCE(f.outcome_score, 0) / 10))::REAL,
+        f.created_at
+    FROM friction_log f
+    WHERE f.embedding IS NOT NULL AND COALESCE(f.status, 'active') = 'active'
+      AND (1 - (f.embedding <=> query_embedding)) > match_threshold
+      AND (memory_type_filter IS NULL OR 'friction' = memory_type_filter)
+
+    UNION ALL
+
+    -- essence (no status column)
+    SELECT e.id, e.content, 'essence'::TEXT,
+        (1 - (e.embedding <=> query_embedding))::REAL,
+        COALESCE(e.outcome_score, 0)::REAL,
+        ((0.7 * (1 - (e.embedding <=> query_embedding))) + (0.3 * COALESCE(e.outcome_score, 0) / 10))::REAL,
+        e.created_at
+    FROM essence e
+    WHERE e.embedding IS NOT NULL
+      AND (1 - (e.embedding <=> query_embedding)) > match_threshold
+      AND (memory_type_filter IS NULL OR 'essence' = memory_type_filter)
+
+    UNION ALL
+
+    -- reflections (no status column)
+    SELECT r.id, r.content, 'reflection'::TEXT,
+        (1 - (r.embedding <=> query_embedding))::REAL,
+        COALESCE(r.outcome_score, 0)::REAL,
+        ((0.7 * (1 - (r.embedding <=> query_embedding))) + (0.3 * COALESCE(r.outcome_score, 0) / 10))::REAL,
+        r.created_at
+    FROM reflections r
+    WHERE r.embedding IS NOT NULL
+      AND (1 - (r.embedding <=> query_embedding)) > match_threshold
+      AND (memory_type_filter IS NULL OR 'reflection' = memory_type_filter)
+
+    UNION ALL
+
+    -- session_logs — content is `summary`, and there is no outcome_score, so
+    -- combined_score is similarity * 0.7 rather than the two-term formula.
+    SELECT sl.id, sl.summary, 'session'::TEXT,
+        (1 - (sl.embedding <=> query_embedding))::REAL,
+        0::REAL,
+        ((1 - (sl.embedding <=> query_embedding)) * 0.7)::REAL,
+        sl.created_at
+    FROM session_logs sl
+    WHERE sl.embedding IS NOT NULL
+      AND (1 - (sl.embedding <=> query_embedding)) > match_threshold
+      AND (memory_type_filter IS NULL OR 'session' = memory_type_filter)
+
+    UNION ALL
+
+    -- people — name and content concatenated, no outcome_score
+    SELECT pp.id, (pp.name || ' — ' || pp.content), 'person'::TEXT,
+        (1 - (pp.embedding <=> query_embedding))::REAL,
+        0::REAL,
+        ((1 - (pp.embedding <=> query_embedding)) * 0.7)::REAL,
+        pp.created_at
+    FROM people pp
+    WHERE pp.embedding IS NOT NULL
+      AND (1 - (pp.embedding <=> query_embedding)) > match_threshold
+      AND (memory_type_filter IS NULL OR 'person' = memory_type_filter)
+
+    UNION ALL
+
+    -- custom_memories (drawers). The filter may name the type OR a drawer.
+    SELECT c.id, c.content, 'custom'::TEXT,
+        (1 - (c.embedding <=> query_embedding))::REAL,
+        COALESCE(c.outcome_score, 0)::REAL,
+        ((0.7 * (1 - (c.embedding <=> query_embedding))) + (0.3 * COALESCE(c.outcome_score, 0) / 10))::REAL,
+        c.created_at
+    FROM custom_memories c
+    WHERE c.embedding IS NOT NULL AND COALESCE(c.status, 'active') = 'active'
+      AND (1 - (c.embedding <=> query_embedding)) > match_threshold
+      AND (memory_type_filter IS NULL OR 'custom' = memory_type_filter OR c.drawer_name = memory_type_filter)
+
+    ORDER BY combined_score DESC
+    LIMIT match_count;
 END;
 $$;
 

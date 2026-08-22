@@ -33,7 +33,12 @@ tag-team produces (all code/SQL, no live DB writes):
 - `src/index.ts`: 3 drawer tools + store/recall/link extended for custom + tableMap/typeToInt entries.
 - `schema.sql`: `custom_drawers` + `custom_memories` + widened lattice CHECK + decay function update.
 - `migrations/custom-drawers.sql`: idempotent delta to run on live projects.
-- `semantic-rpc-custom.sql`: the RPC patch (the one union branch) — applied manually.
+- ~~`semantic-rpc-custom.sql`: the RPC patch (the one union branch) — applied manually.~~
+  **Superseded 2026-08-22.** That file is now a tombstone; applying it would have
+  added a second overload with the wrong signature and taken semantic recall
+  down entirely. The custom_memories branch lives in
+  `migrations/semantic-recall-canonical.sql`, which is transcribed from the
+  deployed function. See `docs/semantic-recall-drift.md`.
 - **`test/custom-drawers.test.ts` (vitest)** — NEW: the repo has no tests, so tag-team gets no green gate without one. Cover the pure logic: drawer-name validation, table routing, type-int mapping, the store/recall arg plumbing. This becomes the deterministic `testCmd`.
 
 ## NOT in the tag-team run (manual follow-ups, gated)

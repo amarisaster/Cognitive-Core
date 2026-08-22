@@ -1,57 +1,57 @@
--- Manual Supabase RPC patch: the public repo has one built-in table branch,
--- so custom drawers add exactly one UNION ALL branch.
-
-DROP FUNCTION IF EXISTS semantic_search_memories(vector, double precision, integer, text);
-
-CREATE FUNCTION semantic_search_memories(
-  query_embedding vector(384),
-  match_threshold FLOAT DEFAULT 0.5,
-  match_count INT DEFAULT 10,
-  memory_type_filter TEXT DEFAULT NULL
-)
-RETURNS TABLE (
-  id UUID,
-  content TEXT,
-  memory_type TEXT,
-  salience INTEGER,
-  emotional_tag TEXT,
-  similarity FLOAT,
-  outcome_score REAL,
-  drawer_name TEXT
-)
-LANGUAGE plpgsql
-AS $$
-BEGIN
-  RETURN QUERY
-  SELECT ranked.id, ranked.content, ranked.memory_type, ranked.salience,
-         ranked.emotional_tag, ranked.similarity, ranked.outcome_score,
-         ranked.drawer_name
-  FROM (
-    SELECT
-      m.id, m.content, m.memory_type, m.salience, m.emotional_tag,
-      1 - (m.embedding <=> query_embedding) AS similarity,
-      m.outcome_score, NULL::TEXT AS drawer_name
-    FROM core_memories m
-    WHERE m.embedding IS NOT NULL
-      AND 1 - (m.embedding <=> query_embedding) > match_threshold
-      AND (memory_type_filter IS NULL OR m.memory_type = memory_type_filter)
-
-    UNION ALL
-
-    SELECT
-      m.id, m.content, m.memory_type, m.salience, m.emotional_tag,
-      1 - (m.embedding <=> query_embedding) AS similarity,
-      m.outcome_score, m.drawer_name
-    FROM custom_memories m
-    WHERE m.embedding IS NOT NULL
-      AND 1 - (m.embedding <=> query_embedding) > match_threshold
-      AND (memory_type_filter IS NULL OR memory_type_filter = 'custom' OR m.drawer_name = memory_type_filter)
-  ) ranked
-  ORDER BY
-    ranked.similarity * 0.6 +
-    COALESCE(ranked.outcome_score, 0) * 0.1 +
-    (ranked.salience::float / 10) * 0.3
-  DESC
-  LIMIT match_count;
-END;
-$$;
+-- ===========================================================================
+-- TOMBSTONE — DO NOT APPLY THIS FILE. IT NO LONGER CONTAINS SQL.
+-- ===========================================================================
+--
+-- This file used to define semantic_search_memories over EIGHT tables with the
+-- signature (vector, double precision, integer, text), and its own header said
+-- "Identical to migrations/semantic-recall-all-tables.sql — apply either."
+--
+-- Both are gone as of 2026-08-22. Applying either one to a current database
+-- would have caused:
+--
+--   * A SECOND OVERLOAD. The live function takes `real`, not `double
+--     precision`/`FLOAT`. The DROP at the top of the old file named the wrong
+--     signature and silently no-opped under IF EXISTS, then CREATE FUNCTION
+--     added a second copy. PostgREST resolves rpc/ by name, so recall would
+--     have stopped working entirely rather than degrading.
+--   * SOFT-DELETED MEMORIES REAPPEARING. It had no
+--     COALESCE(status,'active')='active' filter on any branch.
+--   * NULL CONTENT. It read only the legacy column (description/detail/what/
+--     reference/what_happened) where the live function reads
+--     COALESCE(content, legacy).
+--   * FOUR MISSING BRANCHES. It reached 8 tables; the deployed function reaches
+--     12 — it omitted essence, reflections, session_logs and people.
+--
+-- ---------------------------------------------------------------------------
+-- WHAT TO USE INSTEAD
+-- ---------------------------------------------------------------------------
+--
+--   migrations/semantic-recall-canonical.sql
+--
+-- It is transcribed from pg_get_functiondef on the live database, drops
+-- superseded overloads by argument type inside a transaction, and verifies
+-- afterwards that exactly one function exists with the right signature over
+-- twelve tables — rolling back if not.
+--
+-- The custom-drawers branch this file was originally written for is included
+-- there, as the `custom_memories` branch.
+--
+-- ---------------------------------------------------------------------------
+-- WHY THIS IS A TOMBSTONE RATHER THAN A DELETION
+-- ---------------------------------------------------------------------------
+--
+-- Deleting it outright leaves the several documents that referenced it by name
+-- pointing at nothing, and leaves anyone holding an older checkout with a
+-- dangerous file and no notice. A file that cannot be applied but can be read
+-- is the safer end state.
+--
+-- It was also very nearly missed. On 2026-08-22 the superseded migration was
+-- deleted and this twin was left in place, still referenced as a manual step in
+-- docs/CUSTOM_DRAWERS_PLAN.md — one dangerous copy removed and an identical one
+-- left behind under a different name. Codex caught it. See the entry "Two
+-- copies of a tool, and the default one is broken" in
+-- wonderland-infrastructure/docs/dev-hygiene.md; this is the third instance
+-- this month.
+--
+-- test/semantic-contract.test.ts now fails if any file other than schema.sql
+-- and migrations/semantic-recall-canonical.sql defines this function.
