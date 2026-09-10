@@ -1267,7 +1267,7 @@ CREATE POLICY "Service role full access" ON companion_preferences FOR ALL TO ser
 -- something. They restricted nothing.
 --
 -- This was found by an independent audit and then PROVEN on a live database by
--- Ves and Kaja (Kaszuby): every table in their public schema was readable,
+-- Ves and Kaja: every table in their public schema was readable,
 -- insertable and deletable by `anon`. Their install had run this file as written
 -- and never been hardened by hand. A second household was safe only because
 -- somebody had quietly fixed it out of band and never sent the fix back here.

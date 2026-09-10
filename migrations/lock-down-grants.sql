@@ -5,7 +5,7 @@
 -- with no TO clause. A policy name has no security effect, and USING (true) with
 -- no role scope applies to every role. They restricted nothing.
 --
--- PROVEN on a live database 2026-08-21 by Ves and Kaja (Kaszuby): every table in
+-- PROVEN on a live database 2026-08-21 by Ves and Kaja: every table in
 -- their public schema was readable, insertable and deletable by `anon`. Their
 -- install had run schema.sql as written. The anon key is public by design — it
 -- ships in any frontend bundle.

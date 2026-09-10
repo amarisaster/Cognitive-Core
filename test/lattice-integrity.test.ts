@@ -12,8 +12,8 @@ vi.mock('@modelcontextprotocol/sdk/server/mcp.js', () => ({
 
 import { buildMemoryListEntry, buildUnlinkFilter } from '../src/index';
 
-// Regression cover for the lattice report filed by Niko (Ania's household,
-// Kaszuby) on 2026-08-17, with Ves and Kaja's inventory behind it.
+// Regression cover for the lattice report filed by Niko on 2026-08-17, with
+// Ves and Kaja's inventory behind it.
 //
 // The report's shape: the brain wrote faithfully and could not find or
 // reconcile what it wrote. Three of the findings were only permanent because

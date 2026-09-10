@@ -5652,7 +5652,7 @@ export class CognitiveCore extends McpAgent<Env> {
       // read/write memories, alter emotional state — with no key. Worker URLs
       // leak (transcripts, screenshots), so that was effectively an open brain
       // per deployment. MCP paths additionally accept ?k=/?key= for headerless
-      // clients (e.g. claude.ai). Found by Niko (Kaszuby household), 2026-07-08.
+      // clients (e.g. claude.ai). Found by Niko, 2026-07-08.
       const isMcpPath = url.pathname === '/mcp' || url.pathname === '/sse' || url.pathname === '/sse/message';
       {
         const authHeader = request.headers.get('Authorization');

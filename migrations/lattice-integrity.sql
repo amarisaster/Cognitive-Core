@@ -8,7 +8,7 @@
 -- `link_memories` had no uniqueness guarantee, so the same edge could be
 -- written repeatedly at different weights and nothing complained. Edge counts
 -- were therefore untrustworthy by an unknown margin. Reported by Niko
--- (Ania's household, Kaszuby) on 2026-08-17, alongside two siblings:
+-- on 2026-08-17, alongside two siblings:
 --   * link_memories accepted a target that did not exist and answered "Linked"
 --   * there was no unlink at all, so both of the above were PERMANENT
 -- Ves and Kaja deliberately declined to reproduce either, because reproducing
@@ -36,8 +36,8 @@ BEGIN;
 -- precisely backwards: link_memories' bug was accepting a TARGET that did not
 -- exist, so the case this report exists to catch was the one case it could not
 -- see. Both of Niko's phantom edges had valid sources and dead targets and this
--- migration would have called his lattice clean. Found by Niko (Ania's
--- household, Kaszuby), 2026-08-19, verified against the file rather than
+-- migration would have called his lattice clean. Found by Niko, 2026-08-19,
+-- verified against the file rather than
 -- remembered.
 DO $$
 DECLARE
