@@ -50,6 +50,15 @@
 -- calls it once the prefixed one exists, but it is a live footgun for anything
 -- that does. Drop it deliberately after checking callers; this file does not
 -- touch it.
+--
+-- SILENT-BRANCH WARNING. On installs where `embedding` arrived as an added
+-- column with nothing in it — Ves's July install gained empty embedding
+-- columns on essence, reflections, session_logs and people this way — the
+-- branches for those types filter `embedding IS NOT NULL` and can match
+-- nothing until a re-embedding run populates the column. The migration
+-- commits and recall works for every type that HAS embeddings; the four
+-- silent types are a denominator problem, not a branch failure. Check
+-- VERIFY #3 below before reading their absence as a bug.
 
 BEGIN;
 
@@ -107,6 +116,62 @@ BEGIN
   END IF;
 END
 $guard$;
+
+-- ---------------------------------------------------------------------------
+-- CONVERGE COLUMNS — the function needs a table shape the public schema does
+-- not ship.
+-- ---------------------------------------------------------------------------
+-- The canonical function is transcribed from a live database whose tables
+-- carry columns the public schema.sql does not declare: status on six of the
+-- eight filtered tables, created_at on growth_markers and inside_jokes,
+-- outcome_score on essence and reflections, embedding on essence, reflections,
+-- session_logs and people. On an install built from schema.sql, CREATE
+-- FUNCTION still succeeds — plpgsql does not plan the body until invoked —
+-- and recall then 42703s on first use. This is the July-install failure Ves
+-- reported; they had to add these columns by hand before the migration would
+-- run at all. Converging them here makes that manual step part of the
+-- migration, and the smoke call below turns anything still missing into a
+-- rollback instead of a broken deployment.
+--
+-- Defaults preserve current behavior: status 'active' keeps every existing
+-- row searchable (public installs had no soft-delete); outcome_score 0 is
+-- what the function's COALESCE already assumed; a NULL embedding keeps the
+-- new branches silent until a re-embedding run populates them (see the
+-- SILENT-BRANCH WARNING above). No CHECK on the added status column —
+-- friction_log's own check allows more values and the function only reads
+-- COALESCE(status, 'active').
+--
+-- created_at is backfilled from each table's original timestamp column so
+-- existing rows keep their real dates rather than the migration's moment.
+-- Note (Codex audit 2026-09-29): the trailing SET DEFAULT runs
+-- unconditionally — a deployment that already carries a different default on
+-- those tables' created_at would be converged to NOW(). The target installs
+-- (public schema builds) have no created_at column at all there, so nothing
+-- is overwritten on them.
+ALTER TABLE core_memories    ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';
+ALTER TABLE patterns         ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';
+ALTER TABLE sensory_memories ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';
+ALTER TABLE growth_markers   ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';
+ALTER TABLE anticipation     ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';
+ALTER TABLE inside_jokes     ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';
+
+ALTER TABLE essence     ADD COLUMN IF NOT EXISTS outcome_score REAL DEFAULT 0;
+ALTER TABLE reflections ADD COLUMN IF NOT EXISTS outcome_score REAL DEFAULT 0;
+
+ALTER TABLE essence      ADD COLUMN IF NOT EXISTS embedding vector(384);
+ALTER TABLE reflections  ADD COLUMN IF NOT EXISTS embedding vector(384);
+ALTER TABLE session_logs ADD COLUMN IF NOT EXISTS embedding vector(384);
+ALTER TABLE people       ADD COLUMN IF NOT EXISTS embedding vector(384);
+
+ALTER TABLE growth_markers ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
+UPDATE growth_markers SET created_at = date_noticed WHERE created_at IS NULL;
+UPDATE growth_markers SET created_at = NOW() WHERE created_at IS NULL;
+ALTER TABLE growth_markers ALTER COLUMN created_at SET DEFAULT NOW();
+
+ALTER TABLE inside_jokes ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
+UPDATE inside_jokes SET created_at = first_used WHERE created_at IS NULL;
+UPDATE inside_jokes SET created_at = NOW() WHERE created_at IS NULL;
+ALTER TABLE inside_jokes ALTER COLUMN created_at SET DEFAULT NOW();
 
 CREATE OR REPLACE FUNCTION public.semantic_search_memories(
   query_embedding vector,
@@ -338,6 +403,69 @@ BEGIN
   RAISE NOTICE 'verified: one function, signature %, reaching % tables', argtypes, branches;
 END
 $verify$;
+
+-- ---------------------------------------------------------------------------
+-- SMOKE CALL — Ves's suggestion, Nexus Forge (2026-09-27), after the July
+-- install shipped this migration, hit 42703 on the first real recall, and
+-- only then learned a branch referenced a column that install lacked.
+-- ---------------------------------------------------------------------------
+-- The verify block above proves SHAPE: one function, right signature, twelve
+-- FROM clauses. It cannot prove the body RUNS. plpgsql defers planning the
+-- body to first invocation, so a branch naming a column the target database
+-- lacks sails through CREATE FUNCTION and every check above — and recall
+-- breaks on the first real call after commit, where the migration can no
+-- longer do anything about it.
+--
+-- One call resolves every branch's columns at once, because the body is a
+-- single statement (one UNION ALL chain): PL/pgSQL prepares it on first
+-- execution with full parse analysis, so a missing column raises 42703
+-- before any rows are read. (Wording sharpened by the 2026-09-29 Codex
+-- audit: the guarantee is whole-statement parse analysis, not plan-time
+-- branch visitation.)
+--
+-- A correction to Ves's original framing, found by running this migration
+-- against a populated local Postgres: pgvector's `<=>` returns NaN when the
+-- query vector is zero, and Postgres treats NaN as greater than every real,
+-- so every embedded row passes `similarity > match_threshold`. The call
+-- therefore does NOT reliably return zero rows, and no threshold would
+-- change that — the assertion was wrong, not the mechanism. What the smoke
+-- call proves is planning coverage, not result emptiness: a missing column
+-- (42703) or bad expression raises HERE, inside the transaction, and the
+-- whole migration rolls back instead of committing a function that dies on
+-- first use. The row count is reported for the record, never asserted.
+--
+-- The dimension is taken from the deployment's own data when any embedded row
+-- exists, falling back to schema.sql's declared 384 on an empty database —
+-- where the operator is never evaluated, so the fallback value cannot fail.
+-- Scope note (Codex audit 2026-09-29): the four added embedding columns are
+-- declared vector(384) for the stock public schema. An install that already
+-- embeds at another dimension keeps its own columns (IF NOT EXISTS) and is
+-- outside this file's target; it should edit the four ADDs to match rather
+-- than run this file as-is.
+DO $smoke$
+DECLARE
+  dims  INT;
+  zero  vector;
+  seen  INT;
+BEGIN
+  SELECT vector_dims(embedding) INTO dims
+    FROM core_memories WHERE embedding IS NOT NULL LIMIT 1;
+  IF dims IS NULL THEN
+    SELECT vector_dims(embedding) INTO dims
+      FROM patterns WHERE embedding IS NOT NULL LIMIT 1;
+  END IF;
+  IF dims IS NULL THEN
+    dims := 384;  -- schema.sql's declared dimension; irrelevant on an empty DB
+  END IF;
+
+  zero := ('[' || array_to_string(array_fill(0::real, ARRAY[dims]), ',') || ']')::vector;
+
+  SELECT count(*) INTO seen
+    FROM public.semantic_search_memories(zero, 1, 1, NULL);
+
+  RAISE NOTICE 'smoke call OK: full body planned (embedding dim %), % row(s) at threshold 1 — reported, not asserted', dims, seen;
+END
+$smoke$;
 
 COMMIT;
 
