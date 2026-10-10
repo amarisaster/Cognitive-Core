@@ -52,7 +52,7 @@ wrangler secret put HF_API_TOKEN
 
 ### Supabase Security
 
-- **Row Level Security (RLS)** is enabled on all 23 tables
+- **Row Level Security (RLS)** is enabled on all 51 tables
 - The worker connects with the **service role key**, which bypasses RLS. This is standard for backend services that act as a trusted gateway — the worker itself handles authentication at the API layer, so RLS runs at the worker level, not the database level.
 - The **anon key** should never be used with CogCor. All access goes through the worker.
 

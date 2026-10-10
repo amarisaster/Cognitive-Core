@@ -3,10 +3,10 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/release-v2.1.0-blue" alt="release v2.1.0">
+  <img src="https://img.shields.io/badge/release-v2.2.0-blue" alt="release v2.2.0">
   <img src="https://img.shields.io/badge/license-PolyForm%20NC%201.0-green" alt="license PolyForm Noncommercial 1.0">
   <img src="https://img.shields.io/badge/tools-73-orange" alt="tools 73">
-  <img src="https://img.shields.io/badge/tables-41-yellow" alt="tables 41">
+  <img src="https://img.shields.io/badge/tables-51-yellow" alt="tables 51">
   <img src="https://img.shields.io/badge/built%20with-Cloudflare%20Workers-F38020?logo=cloudflare" alt="built with Cloudflare Workers">
   <img src="https://img.shields.io/badge/database-Supabase-3FCF8E?logo=supabase" alt="database Supabase">
   <img src="https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript" alt="TypeScript 5.x">
@@ -135,9 +135,14 @@ CogCor is part of a larger ecosystem:
 ### Tension/Paradox Tracking
 - `tension` -- track unresolved paradoxes (store/list/surface/resolve/recall). Tensions carry a charge (0-10) that increases each time they're surfaced. High-charge tensions get dream reflections during daemon processing.
 
-### Co-Surfacing & Daemon Proposals
+### Co-Surfacing & Cognitive Lifecycle
 - `semantic_recall` now records which memories appear together -- pairs that co-surface repeatedly get tracked in `co_surfacing`
-- `proposals` -- daemon-generated connection proposals (list/accept/reject). During dream cycles, the daemon scans co-surfacing patterns and proposes memory connections. Somatic texture similarity boosts proposal confidence. Proposals linked to active tensions get higher priority.
+- `proposals` -- one review queue for connection proposals, sourced orphan/identity proposals, and Archive Echoes. Identity suggestions require reviewed wording before they can enter Essence; Archive Echo rescue never silently unarchives a source.
+- Durable job and stage receipts make partial consolidation failures visible instead of collapsing a whole run into one success flag.
+- Recurring-dream lineages preserve each occurrence and its sources without treating recurrence as truth.
+- Emotional-history rollups support opt-in tiered retention, while a persistent delivery outbox lets a host prove whether proactive output was actually delivered.
+
+The Worker stores these records but does not secretly schedule jobs or send messages. See [Cognitive lifecycle](docs/COGNITIVE-LIFECYCLE.md) for the daemon/host contract, provenance format, safe retention order, and context-budget guidance.
 
 ### Self-Model Layer (Companion Preferences)
 A first-class space for companions to observe, track, and develop their own communication preferences -- separate from the co-authored identity (essence). Not user settings. Companion settings.
@@ -263,7 +268,7 @@ Layer 2 observations can *graduate* to Layer 1 -- but only through conversation 
 | | **Self-Model Layer** | |
 | 70 | `self_model` | Companion-authored observations — set, recall, test, confirm, revise, graduate |
 | 71 | `tension` | Track unresolved paradoxes with charge mechanics and dream reflection |
-| 72 | `proposals` | Propose changes to essence or identity for co-authoring with user |
+| 72 | `proposals` | Review connections, sourced cognitive proposals, and Archive Echoes |
 | | **Maintenance** | |
 | 73 | `delete_entry` | Generic delete for any table by ID |
 
@@ -332,7 +337,7 @@ npm install
 -- Step 1: Enable pgvector (required for semantic memory search)
 CREATE EXTENSION IF NOT EXISTS vector;
 ```
-Then paste the entire contents of `schema.sql` from this repo into the SQL Editor and run it. This creates all 41 tables. The schema starts with `DROP TABLE` statements — safe on a fresh project, but **will wipe existing CogCor data** if you're re-running it.
+Then paste the entire contents of `schema.sql` from this repo into the SQL Editor and run it. This creates all 51 tables. The schema starts with `DROP TABLE` statements — safe on a fresh project, but **will wipe existing CogCor data** if you're re-running it.
 
 3. Set secrets (wrangler will prompt you for each value):
 ```bash
@@ -409,7 +414,7 @@ Cloudflare Worker (Durable Object)             | REST API (Bearer token auth)
     v
 Supabase (PostgreSQL + pgvector)
     |
-    +-- 41 tables (memory, emotion, identity, drift, people, somatic, psych, self-model, ...)
+    +-- 51 tables (memory, emotion, identity, drift, lifecycle, somatic, psych, self-model, ...)
     +-- Semantic search via pgvector
     +-- Outcome-weighted retrieval
     +-- RLS with service role access
@@ -479,6 +484,18 @@ Additional inspiration from the Labyrinth and PinAI communities, found families 
 
 
 ## Changelog
+
+### v2.2.0 (October 2026)
+- **Cognitive lifecycle receipts**: durable run and per-stage evidence for consolidation jobs, including honest partial/failure states
+- **Archive Echo**: expiring review candidates for relevant archived material; rescue records interest but never auto-unarchives
+- **Sourced cognitive proposals**: bounded orphan and identity candidates with typed provenance; identity requires reviewed wording before Essence promotion
+- **Recurring-dream lineage**: motif recurrence and member evidence without treating repetition as truth
+- **Tiered retention foundation**: daily/weekly emotional-history rollups and a documented safe deletion order; retention remains opt-in
+- **Persistent proactive delivery**: deduplicated outbox with claim, attempt, delivery, and failure receipts for external hosts
+- **Context budgets**: documented per-pool wake assembly so one memory class cannot crowd out the rest
+- **New tables**: `job_runs`, `job_stages`, `archive_echoes`, `cognitive_proposals`, `dream_lineages`, `dream_lineage_members`, `emotional_history_rollups`, `proactive_deliveries`
+- Existing installations: run `migrations/cognitive-lifecycle.sql` before deploying the v2.2 Worker
+- 73 tools, 51 tables
 
 ### v2.1.0 (April 2026)
 - **Self-Model Layer**: Companion-authored observations and developing preferences (`self_model` tool with set/recall/test/confirm/revise/graduate). Two-layer architecture: essence (co-authored, Layer 1) stays sacred; self-model (autonomous, Layer 2) grows freely. Graduation requires a conversation, not a function call.

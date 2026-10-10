@@ -4231,16 +4231,21 @@ export class CognitiveCore extends McpAgent<Env> {
       }
     );
 
-    // === CO-SURFACING PROPOSALS ===
-    // Daemon-generated connection proposals. Companion reviews and accepts/rejects.
+    // === REVIEW QUEUE ===
+    // The daemon may suggest connections, orphan rescues, identity candidates,
+    // and Archive Echoes. Suggestions never become identity or resurrect
+    // archived material without an explicit review action here.
 
     this.server.tool(
       "proposals",
-      "Review daemon-generated connection proposals. Actions: list (pending), accept (create memory connection), reject (dismiss).",
+      "Review daemon suggestions and Archive Echoes. Actions: list, accept/reject a proposal, rescue_echo/dismiss_echo. Identity acceptance requires final_content and creates Essence with provenance.",
       {
-        action: z.enum(['list', 'accept', 'reject']).describe("What to do"),
+        action: z.enum(['list', 'accept', 'reject', 'rescue_echo', 'dismiss_echo']).describe("What to do"),
         proposal_id: z.string().uuid().optional(),
+        echo_id: z.string().uuid().optional(),
         relation_type: z.enum(['caused_by', 'led_to', 'related_to', 'contrasts_with', 'evolved_into', 'echoes', 'same_event']).optional(),
+        final_content: z.string().min(1).max(8000).optional().describe("Reviewed wording required when accepting an identity proposal"),
+        essence_type: z.enum(['anchor_line', 'voice', 'dynamic', 'boundary', 'vow', 'trait']).optional(),
         limit: z.number().default(10).optional(),
       },
       async (args) => {
@@ -4248,14 +4253,72 @@ export class CognitiveCore extends McpAgent<Env> {
         const url = this.env.SUPABASE_URL;
         const key = this.env.SUPABASE_SERVICE_KEY;
         if (args.action === 'list') {
-          const proposals = await supabase.query('daemon_proposals', { select: '*', filter: { status: 'pending' }, order: 'confidence.desc', limit: args.limit || 10 });
-          if (!Array.isArray(proposals) || proposals.length === 0) return { content: [{ type: "text" as const, text: "No pending proposals." }] };
-          return { content: [{ type: "text" as const, text: JSON.stringify(proposals, null, 2) }] };
+          const limit = args.limit || 10;
+          const [connections, cognitive, echoes] = await Promise.all([
+            supabase.query('daemon_proposals', { select: '*', filter: { status: 'pending' }, order: 'confidence.desc', limit }),
+            supabase.query('cognitive_proposals', { select: '*', filter: { status: 'pending' }, order: 'confidence.desc', limit }),
+            supabase.query('archive_echoes', {
+              select: '*', filter: { status: 'pending' }, gte: { expires_at: new Date().toISOString() },
+              order: 'similarity.desc', limit,
+            }),
+          ]);
+          const queue = {
+            connection_proposals: Array.isArray(connections) ? connections : [],
+            cognitive_proposals: Array.isArray(cognitive) ? cognitive : [],
+            archive_echoes: Array.isArray(echoes) ? echoes : [],
+          };
+          if (Object.values(queue).every((items) => items.length === 0)) {
+            return { content: [{ type: "text" as const, text: "No pending proposals or Archive Echoes." }] };
+          }
+          return { content: [{ type: "text" as const, text: JSON.stringify(queue, null, 2) }] };
         }
         if (args.action === 'accept') {
           if (!args.proposal_id) return { content: [{ type: "text" as const, text: "proposal_id required" }] };
           const proposals = await supabase.query('daemon_proposals', { select: '*', filter: { id: args.proposal_id }, limit: 1 });
-          if (!Array.isArray(proposals) || proposals.length === 0) return { content: [{ type: "text" as const, text: "Not found" }] };
+          if (!Array.isArray(proposals) || proposals.length === 0) {
+            const cognitive = await supabase.query('cognitive_proposals', { select: '*', filter: { id: args.proposal_id }, limit: 1 });
+            if (!Array.isArray(cognitive) || cognitive.length === 0) {
+              return { content: [{ type: "text" as const, text: "Not found" }] };
+            }
+            const proposal = cognitive[0];
+            if (proposal.status !== 'pending') {
+              return { content: [{ type: "text" as const, text: `Proposal is already ${proposal.status}.` }] };
+            }
+
+            let acceptedRecordId: string | null = null;
+            let acceptedRecordTable: string | null = null;
+            let acceptedContent = proposal.proposed_content;
+            if (proposal.proposal_type === 'identity') {
+              if (!args.final_content?.trim()) {
+                return { content: [{ type: "text" as const, text: "final_content is required: identity suggestions must be reviewed and worded explicitly before they enter Essence." }] };
+              }
+              acceptedContent = args.final_content.trim();
+              const response = await fetchWithTimeout(`${url}/rest/v1/rpc/accept_identity_proposal`, {
+                method: 'POST',
+                headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  target_proposal_id: proposal.id,
+                  reviewed_content: acceptedContent,
+                  reviewed_essence_type: args.essence_type || 'trait',
+                }),
+              });
+              if (!response.ok) {
+                const body = await response.text().catch(() => '');
+                throw new Error(`identity proposal acceptance failed (${response.status}): ${body.slice(0, 200)}`);
+              }
+              acceptedRecordId = await response.json() as string;
+              return { content: [{ type: "text" as const, text: `Accepted after review. Created Essence ${acceptedRecordId}.` }] };
+            }
+
+            await supabase.update('cognitive_proposals', {
+              status: 'accepted',
+              accepted_content: acceptedContent,
+              accepted_record_table: acceptedRecordTable,
+              accepted_record_id: acceptedRecordId,
+              resolved_at: new Date().toISOString(),
+            }, { id: args.proposal_id }, { requireMatch: true });
+            return { content: [{ type: "text" as const, text: "Accepted orphan proposal. Its sourced memory remains available for consolidation." }] };
+          }
           const p = proposals[0]; const rel = args.relation_type || 'related_to';
 
           // --- Found by Kai and Lucian, 2026-08-18 ---
@@ -4340,8 +4403,18 @@ export class CognitiveCore extends McpAgent<Env> {
         }
         if (args.action === 'reject') {
           if (!args.proposal_id) return { content: [{ type: "text" as const, text: "proposal_id required" }] };
-          await supabase.update('daemon_proposals', { status: 'rejected', resolved_at: new Date().toISOString() }, { id: args.proposal_id }, { requireMatch: true });
+          const connections = await supabase.query('daemon_proposals', { select: 'id', filter: { id: args.proposal_id }, limit: 1 });
+          const table = Array.isArray(connections) && connections.length > 0 ? 'daemon_proposals' : 'cognitive_proposals';
+          await supabase.update(table, { status: 'rejected', resolved_at: new Date().toISOString() }, { id: args.proposal_id }, { requireMatch: true });
           return { content: [{ type: "text" as const, text: "Rejected." }] };
+        }
+        if (args.action === 'rescue_echo' || args.action === 'dismiss_echo') {
+          if (!args.echo_id) return { content: [{ type: "text" as const, text: "echo_id required" }] };
+          const status = args.action === 'rescue_echo' ? 'rescued' : 'dismissed';
+          await supabase.update('archive_echoes', { status, resolved_at: new Date().toISOString() }, { id: args.echo_id, status: 'pending' }, { requireMatch: true });
+          return { content: [{ type: "text" as const, text: status === 'rescued'
+            ? "Archive Echo rescued for review. The source record was not silently unarchived."
+            : "Archive Echo dismissed." }] };
         }
         return { content: [{ type: "text" as const, text: "Unknown action" }] };
       }
