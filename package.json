@@ -1,6 +1,6 @@
 {
   "name": "cogcor-mcp",
-  "version": "1.0.0",
+  "version": "2.2.0",
   "description": "CogCor — Cognitive Core MCP Server. Persistent memory, emotional state, identity, and drift detection for AI companions.",
   "main": "src/index.ts",
   "scripts": {
